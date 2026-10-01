@@ -9,7 +9,7 @@ set -eu
 root=$(cd "$(dirname "$0")/../.." && pwd)
 dir=$(mktemp -d)
 pids=""
-trap 'kill $pids 2>/dev/null; rm -rf "$dir"' EXIT
+trap 'kill $pids 2>/dev/null || true; rm -rf "$dir"' EXIT
 
 export XDG_RUNTIME_DIR="$dir/run" XDG_STATE_HOME="$dir/state" WAYLAND_DISPLAY=wayland-test
 unset DISPLAY
