@@ -5,7 +5,7 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::catalog::{self, Capability, Finder};
@@ -14,7 +14,7 @@ use crate::intent::{Intent, NormRect, OrderKey, RegionSpec};
 
 pub const IR_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Step {
     Input,
@@ -107,7 +107,7 @@ pub enum ValueType {
     Unit,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct Plan {
     pub ir_version: u32,
     pub steps: Vec<Step>,

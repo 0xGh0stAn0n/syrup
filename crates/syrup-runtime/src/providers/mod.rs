@@ -5,11 +5,13 @@ pub mod tesseract;
 pub mod yunet;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::abi::SyrupDetection;
 use crate::catalog::Capability;
 use crate::contract::ProviderInfo;
-use crate::error::Result;
+use crate::custom;
+use crate::error::{ErrorKind, Result, Stage, SyrupError};
 
 /// A window of the input image, borrowed for one `detect` call.
 pub struct ViewRef<'a> {
@@ -25,6 +27,15 @@ impl ViewRef<'_> {
         let c = self.channels as usize;
         let at = y as usize * self.stride + x as usize * c;
         &self.data[at..at + c]
+    }
+
+    /// The pixels with rows packed tightly: `height * width * channels` bytes.
+    pub fn packed(&self) -> Vec<u8> {
+        let row = self.width as usize * self.channels as usize;
+        (0..self.height as usize)
+            .flat_map(|y| &self.data[y * self.stride..][..row])
+            .copied()
+            .collect()
     }
 
     pub fn to_rgba(&self) -> image::RgbaImage {
@@ -71,29 +82,40 @@ pub enum ModelSource {
 }
 
 pub struct Providers {
-    face: Box<dyn Provider>,
-    text: tesseract::Tesseract,
+    face: Arc<dyn Provider>,
+    text: Arc<dyn Provider>,
 }
 
 impl Providers {
     pub fn new(face_model: ModelSource) -> Providers {
         #[cfg(feature = "face-yunet")]
-        let face: Box<dyn Provider> = Box::new(yunet::YuNet::new(face_model));
+        let face: Arc<dyn Provider> = Arc::new(yunet::YuNet::new(face_model));
         #[cfg(not(feature = "face-yunet"))]
-        let face: Box<dyn Provider> = {
+        let face: Arc<dyn Provider> = {
             let _ = face_model;
-            Box::new(Unavailable)
+            Arc::new(Unavailable)
         };
         Providers {
             face,
-            text: tesseract::Tesseract,
+            text: Arc::new(tesseract::Tesseract),
         }
     }
 
-    pub fn get(&self, capability: Capability) -> &dyn Provider {
+    pub fn get(&self, capability: Capability) -> Result<Arc<dyn Provider>> {
         match capability {
-            Capability::FaceDetection => self.face.as_ref(),
-            Capability::TextRecognition => &self.text,
+            Capability::FaceDetection => Ok(self.face.clone()),
+            Capability::TextRecognition => Ok(self.text.clone()),
+            Capability::Custom(name) => custom::provider(name).ok_or_else(|| {
+                SyrupError::new(
+                    Stage::Execute,
+                    ErrorKind::MissingDependency,
+                    format!(
+                        "no detector for {} is registered in this process",
+                        name.as_str()
+                    ),
+                )
+                .with_hint("add the target (syrup.add_target) before running operations on it")
+            }),
         }
     }
 }
@@ -113,7 +135,6 @@ impl Provider for Unavailable {
     }
 
     fn detect(&self, _: &ViewRef<'_>) -> Result<Detections> {
-        use crate::error::{ErrorKind, Stage, SyrupError};
         Err(SyrupError::new(
             Stage::Execute,
             ErrorKind::MissingDependency,

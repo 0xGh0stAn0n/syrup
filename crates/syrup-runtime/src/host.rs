@@ -86,7 +86,7 @@ impl<'a> ExecHost<'a> {
             )
         })?;
         let view = self.view(view)?;
-        let Detections { mut boxes, texts } = self.providers.get(capability).detect(&view)?;
+        let Detections { mut boxes, texts } = self.providers.get(capability)?.detect(&view)?;
         let malformed = |what: String| {
             SyrupError::new(
                 Stage::Execute,
