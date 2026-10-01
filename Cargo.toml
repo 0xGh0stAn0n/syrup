@@ -29,3 +29,16 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "primitives"
 harness = false
+
+# The core stays a standalone package at the root, so path and submodule
+# consumers keep working. The runtime that turns intents into compiled
+# native operations is a separate member; the Python extension is built by
+# maturin with its own lockfile (it links against Python, which a plain
+# `cargo test --workspace` should not need).
+[workspace]
+members = ["crates/syrup-runtime"]
+exclude = ["crates/syrup-python"]
+
+# Face detection runs in tests; unoptimised tract makes them crawl.
+[profile.dev.package."*"]
+opt-level = 2
