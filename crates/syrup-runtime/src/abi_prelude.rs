@@ -1,6 +1,7 @@
 // Syrup operation ABI v1. Included by the host and pasted verbatim into every
-// generated module, so both sides always agree. Bump SYRUP_ABI_VERSION on any
-// change.
+// generated module, so both sides always agree. Bump SYRUP_ABI_VERSION when a
+// type's layout or a function's meaning changes; new capability ids are not
+// breaking, since hosts refuse ids they do not know.
 //
 // Views are borrowed for one call. Detections returned by `detect` belong to
 // the host and stay valid only until the module's next call into the host.
@@ -15,6 +16,7 @@ pub const SYRUP_ERR_PANIC: i32 = 4;
 pub const SYRUP_ERR_EMIT: i32 = 5;
 
 pub const SYRUP_CAP_FACE: u32 = 1;
+pub const SYRUP_CAP_TEXT: u32 = 2;
 
 pub const SYRUP_MAX_KEYPOINTS: usize = 5;
 

@@ -145,7 +145,8 @@ fn annotate(image: &OwnedImage, result: &FindResult) -> image::RgbaImage {
             green,
             2,
         );
-        let label = format!("{} {:.2}", found.label, found.confidence);
+        let what = found.text.as_deref().unwrap_or(found.label);
+        let label = format!("{what} {:.2}", found.confidence);
         let (width, height) = (out.width() as i64, out.height() as i64);
         syrup::draw::draw_text(&label, x as i64, y as i64 - 10, 1, |px, py| {
             if (0..width).contains(&px) && (0..height).contains(&py) {

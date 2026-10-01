@@ -1,5 +1,6 @@
 //! Capabilities the host offers generated modules.
 
+pub mod tesseract;
 #[cfg(feature = "face-yunet")]
 pub mod yunet;
 
@@ -20,12 +21,27 @@ pub struct ViewRef<'a> {
 }
 
 impl ViewRef<'_> {
-    pub fn to_rgb(&self) -> image::RgbImage {
+    fn pixel(&self, x: u32, y: u32) -> &[u8] {
         let c = self.channels as usize;
+        let at = y as usize * self.stride + x as usize * c;
+        &self.data[at..at + c]
+    }
+
+    pub fn to_rgba(&self) -> image::RgbaImage {
+        image::RgbaImage::from_fn(self.width, self.height, |x, y| {
+            let p = self.pixel(x, y);
+            image::Rgba(match p.len() {
+                1 => [p[0], p[0], p[0], 255],
+                3 => [p[0], p[1], p[2], 255],
+                _ => [p[0], p[1], p[2], p[3]],
+            })
+        })
+    }
+
+    pub fn to_rgb(&self) -> image::RgbImage {
         image::RgbImage::from_fn(self.width, self.height, |x, y| {
-            let at = y as usize * self.stride + x as usize * c;
-            let p = &self.data[at..at + c];
-            image::Rgb(if c == 1 {
+            let p = self.pixel(x, y);
+            image::Rgb(if p.len() == 1 {
                 [p[0]; 3]
             } else {
                 [p[0], p[1], p[2]]
@@ -34,11 +50,18 @@ impl ViewRef<'_> {
     }
 }
 
+/// Boxes in the view's pixel coordinates, unclipped, and for providers that
+/// read text, one string per box.
+#[derive(Debug, Default)]
+pub struct Detections {
+    pub boxes: Vec<SyrupDetection>,
+    pub texts: Vec<String>,
+}
+
 pub trait Provider: Send + Sync {
     fn info(&self) -> ProviderInfo;
 
-    /// Detections in the view's pixel coordinates, unclipped.
-    fn detect(&self, view: &ViewRef<'_>) -> Result<Vec<SyrupDetection>>;
+    fn detect(&self, view: &ViewRef<'_>) -> Result<Detections>;
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,6 +72,7 @@ pub enum ModelSource {
 
 pub struct Providers {
     face: Box<dyn Provider>,
+    text: tesseract::Tesseract,
 }
 
 impl Providers {
@@ -60,12 +84,16 @@ impl Providers {
             let _ = face_model;
             Box::new(Unavailable)
         };
-        Providers { face }
+        Providers {
+            face,
+            text: tesseract::Tesseract,
+        }
     }
 
     pub fn get(&self, capability: Capability) -> &dyn Provider {
         match capability {
             Capability::FaceDetection => self.face.as_ref(),
+            Capability::TextRecognition => &self.text,
         }
     }
 }
@@ -84,7 +112,7 @@ impl Provider for Unavailable {
         }
     }
 
-    fn detect(&self, _: &ViewRef<'_>) -> Result<Vec<SyrupDetection>> {
+    fn detect(&self, _: &ViewRef<'_>) -> Result<Detections> {
         use crate::error::{ErrorKind, Stage, SyrupError};
         Err(SyrupError::new(
             Stage::Execute,

@@ -8,13 +8,15 @@ use crate::abi::*;
 use crate::catalog::Capability;
 use crate::contract::ImageInput;
 use crate::error::{ErrorKind, Result, Stage, SyrupError};
-use crate::providers::{Providers, ViewRef};
+use crate::providers::{Detections, Providers, ViewRef};
 
 pub struct ExecHost<'a> {
     image: ImageInput<'a>,
     providers: &'a Providers,
     scratch: Vec<SyrupDetection>,
     pub out: Vec<SyrupDetection>,
+    /// Text read by providers; a detection's payload is its index + 1.
+    pub texts: Vec<String>,
     pub error: Option<SyrupError>,
 }
 
@@ -25,6 +27,7 @@ impl<'a> ExecHost<'a> {
             providers,
             scratch: vec![],
             out: vec![],
+            texts: vec![],
             error: None,
         }
     }
@@ -79,18 +82,32 @@ impl<'a> ExecHost<'a> {
             )
         })?;
         let view = self.view(view)?;
-        let detections = self.providers.get(capability).detect(&view)?;
-        if let Some(bad) = detections.iter().find(|d| !well_formed(d)) {
-            return Err(SyrupError::new(
+        let Detections { mut boxes, texts } = self.providers.get(capability).detect(&view)?;
+        let malformed = |what: String| {
+            SyrupError::new(
                 Stage::Execute,
                 ErrorKind::ProviderFailed,
-                format!(
-                    "the {} provider returned a malformed detection: {bad:?}",
-                    capability.as_str()
-                ),
-            ));
+                format!("the {} provider returned {what}", capability.as_str()),
+            )
+        };
+        if let Some(bad) = boxes.iter().find(|d| !well_formed(d)) {
+            return Err(malformed(format!("a malformed detection: {bad:?}")));
         }
-        self.scratch = detections;
+        if !texts.is_empty() && texts.len() != boxes.len() {
+            return Err(malformed(format!(
+                "{} texts for {} boxes",
+                texts.len(),
+                boxes.len()
+            )));
+        }
+        for d in &mut boxes {
+            d.payload = 0;
+        }
+        for (d, text) in boxes.iter_mut().zip(texts) {
+            self.texts.push(text);
+            d.payload = self.texts.len() as u64;
+        }
+        self.scratch = boxes;
         Ok(())
     }
 }

@@ -522,6 +522,7 @@ impl Operation {
                 && d.x + d.w <= w
                 && d.y + d.h <= h
                 && d.score >= min_confidence
+                && d.payload as usize <= host.texts.len()
                 && d.keypoints[..2 * n]
                     .chunks(2)
                     .all(|k| (0.0..=w).contains(&k[0]) && (0.0..=h).contains(&k[1]))
@@ -563,6 +564,7 @@ impl Operation {
                         y: d.keypoints[2 * k + 1],
                     })
                     .collect(),
+                text: (d.payload > 0).then(|| host.texts[d.payload as usize - 1].clone()),
             })
             .collect();
         let manifest = &loaded.manifest;

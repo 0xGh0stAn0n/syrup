@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import sys
 
@@ -168,3 +169,11 @@ except syrup.SyrupError as e:
     assert missing == "DependencyError compile missing_dependency"
     frozen = python(code, SYRUP_CACHE_DIR=str(tmp_path / "b"), SYRUP_MODE="frozen")
     assert frozen == "LoadError load not_prepared"
+
+
+@pytest.mark.skipif(shutil.which("tesseract") is None, reason="Tesseract is not installed")
+def test_words_carry_their_text():
+    words = syrup.ops.find_words_left_to_right(FIXTURES / "words.png")
+    assert [w.text for w in words if w.box.y > 150] == ["HELLO", "WORLD"]
+    assert all(w.label == "word" and w.confidence > 0.9 for w in words)
+    assert syrup.ops.find_face(ASTRONAUT)[0].text is None

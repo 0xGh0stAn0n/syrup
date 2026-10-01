@@ -20,7 +20,7 @@ an ordinary `NameError`; Python has no honest hook for that.
 ```text
 name      := verb "_" [count "_" selector "_" | selector "_" | "all_"] target ("_" clause)*
 verb      := find | detect | locate
-target    := face | faces | human_face | human_faces
+target    := face | faces | human_face | human_faces | word | words
 selector  := largest | biggest | smallest | leftmost | rightmost | topmost | bottommost | most_confident
 count     := 1..100, or one..ten
 clause    := in_<region> | by_size | by_area | by_confidence | by_score
@@ -31,7 +31,8 @@ region    := top_half | bottom_half | left_half | right_half
            | top_third | bottom_third | left_third | right_third | center | region
 ```
 
-Singular and plural mean the same: `find_face` returns every face, so
+Faces come from YuNet, words from Tesseract. Singular and plural mean the
+same: `find_face` returns every face, so
 `faces = find_face(img)` reads right. One result is spelled with a selector:
 `find_largest_face`. Names that differ only by synonym, number or clause
 order resolve to the same intent and share one compiled artifact.
@@ -62,6 +63,8 @@ to one item.
 - `keypoints`: named points, same coordinates, clipped. Faces carry
   `right_eye`, `left_eye`, `nose_tip`, `right_mouth_corner`,
   `left_mouth_corner` (the subject's right and left).
+- `text`: what a word says; empty for targets that do not read text. A
+  word's confidence is Tesseract's, divided by 100.
 
 Default order is confidence, highest first. Every order ends with the same
 tie-breakers (confidence ↓, then y, x, h, w ↑), so it is total.
@@ -84,7 +87,7 @@ Per-call parameters never trigger a rebuild:
 
 | | default | |
 |---|---|---|
-| `min_confidence` | faces 0.6 | in `[0, 1]`; the face provider never reports below 0.1 |
+| `min_confidence` | faces 0.6, words 0.5 | in `[0, 1]`; the face provider never reports below 0.1 |
 | `max_results` | none | ≥ 1, applied after the operation's own limit |
 | `region` | | required by `_in_region` operations, refused by all others |
 
