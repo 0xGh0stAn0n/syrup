@@ -170,6 +170,21 @@ The `Detection<T>` vocabulary is the library's one contract: a detector
 never returns a bare "not found" — it says *why* not, and never returns a
 value without saying *how sure* it is.
 
+## Performance
+
+`cargo bench -p syrup-runtime --bench runtime` measures what an operation
+costs. On a 4-core x86_64 Linux machine:
+
+| | |
+|---|---|
+| first use (generate, compile, validate) | 0.34 s (`find_face`) to 0.57 s (`measure_fill_of_largest_red_bar`) |
+| later uses | loaded from memory or disk, under 1 ms |
+| `find_face`, 1280x720 frame | 90 ms |
+| colour regions and bars, 1280x720 | 12 ms |
+| QR codes / text blocks / panels, 1280x720 | 20 / 12 / 11 ms |
+| `measure_sharpness`, 1280x720 | 4 ms |
+| `track_moving_regions`, per 1200x720 frame | 5 ms |
+
 ## Testing
 
 ```sh

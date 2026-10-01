@@ -2,8 +2,9 @@
 //! post-processing follow OpenCV's `FaceDetectorYN`.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fs;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use image::imageops::{self, FilterType};
 use sha2::{Digest, Sha256};
@@ -18,18 +19,22 @@ use crate::plan::hex;
 const BUNDLED: &[u8] = include_bytes!("../../models/face_detection_yunet_2023mar.onnx");
 pub const MODEL_SHA256: &str = "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4";
 
-// The image is scaled to fit this square canvas (padded right and bottom).
+// The image is scaled so its longer side is this long, then padded right
+// and bottom to a multiple of the largest stride. The network runs at that
+// size, prepared once per size.
 const CANVAS: usize = 640;
 const STRIDES: [usize; 3] = [8, 16, 32];
 // Candidates below this score are dropped before NMS.
 const SCORE_FLOOR: f32 = 0.1;
 const NMS_IOU: f32 = 0.3;
 
-type Model = std::sync::Arc<TypedRunnableModel>;
+type Model = Arc<TypedRunnableModel>;
 
 pub struct YuNet {
     source: ModelSource,
-    model: OnceLock<Result<Model>>,
+    graph: OnceLock<Result<InferenceModel>>,
+    /// Prepared models by (height, width).
+    models: Mutex<HashMap<(usize, usize), Model>>,
 }
 
 fn failed(reason: String) -> SyrupError {
@@ -40,19 +45,35 @@ impl YuNet {
     pub fn new(source: ModelSource) -> YuNet {
         YuNet {
             source,
-            model: OnceLock::new(),
+            graph: OnceLock::new(),
+            models: Mutex::default(),
         }
     }
 
-    fn model(&self) -> Result<&Model> {
-        self.model
+    fn model(&self, height: usize, width: usize) -> Result<Model> {
+        let mut models = self.models.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(model) = models.get(&(height, width)) {
+            return Ok(model.clone());
+        }
+        let graph = self
+            .graph
             .get_or_init(|| load(&self.source))
             .as_ref()
-            .map_err(Clone::clone)
+            .map_err(Clone::clone)?;
+        let model = graph
+            .clone()
+            .with_input_fact(0, f32::fact([1, 3, height, width]).into())
+            .and_then(|m| m.into_optimized())
+            .and_then(|m| m.into_runnable())
+            .map_err(|e| failed(format!("cannot prepare the face model: {e:#}")))?;
+        models.insert((height, width), model.clone());
+        Ok(model)
     }
 }
 
-fn load(source: &ModelSource) -> Result<Model> {
+/// The verified model, with the shapes the file declares for intermediate
+/// values cleared: they assume a 640x640 input.
+fn load(source: &ModelSource) -> Result<InferenceModel> {
     let bytes = match source {
         ModelSource::Bundled => Cow::Borrowed(BUNDLED),
         ModelSource::File(path) => Cow::Owned(fs::read(path).map_err(|e| {
@@ -73,12 +94,15 @@ fn load(source: &ModelSource) -> Result<Model> {
         )
         .with_hint("the decoder is specific to this exact model; restore the original file"));
     }
-    tract_onnx::onnx()
+    let mut graph = tract_onnx::onnx()
         .model_for_read(&mut &bytes[..])
-        .and_then(|m| m.with_input_fact(0, f32::fact([1, 3, CANVAS, CANVAS]).into()))
-        .and_then(|m| m.into_optimized())
-        .and_then(|m| m.into_runnable())
-        .map_err(|e| failed(format!("cannot prepare the face model: {e:#}")))
+        .map_err(|e| failed(format!("cannot read the face model: {e:#}")))?;
+    for node in graph.nodes_mut() {
+        for output in &mut node.outputs {
+            output.fact = InferenceFact::default();
+        }
+    }
+    Ok(graph)
 }
 
 impl Provider for YuNet {
@@ -92,14 +116,19 @@ impl Provider for YuNet {
     }
 
     fn detect(&self, view: &ViewRef<'_>) -> Result<Detections> {
-        let model = self.model()?;
         let scale = (CANVAS as f32 / view.width as f32).min(CANVAS as f32 / view.height as f32);
         let w = ((view.width as f32 * scale).round() as u32).clamp(1, CANVAS as u32);
         let h = ((view.height as f32 * scale).round() as u32).clamp(1, CANVAS as u32);
+        let largest = STRIDES[STRIDES.len() - 1];
+        let (height, width) = (
+            (h as usize).div_ceil(largest) * largest,
+            (w as usize).div_ceil(largest) * largest,
+        );
+        let model = self.model(height, width)?;
         let resized = imageops::resize(&view.to_rgb(), w, h, FilterType::Triangle);
 
         // BGR, 0..255, no normalisation.
-        let mut input = tract_ndarray::Array4::<f32>::zeros((1, 3, CANVAS, CANVAS));
+        let mut input = tract_ndarray::Array4::<f32>::zeros((1, 3, height, width));
         for (x, y, p) in resized.enumerate_pixels() {
             let (x, y) = (x as usize, y as usize);
             input[[0, 0, y, x]] = p[2] as f32;
@@ -132,8 +161,8 @@ impl Provider for YuNet {
 
         let mut candidates = vec![];
         for (s, stride) in STRIDES.into_iter().enumerate() {
-            let cols = CANVAS / stride;
-            let cells = cols * cols;
+            let cols = width / stride;
+            let cells = cols * (height / stride);
             let cls = output(s, 1, cells)?;
             let obj = output(s + 3, 1, cells)?;
             let bbox = output(s + 6, 4, cells)?;

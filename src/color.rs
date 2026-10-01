@@ -45,12 +45,19 @@ pub fn is_color_pixel(
     min_saturation: f32,
     min_value: f32,
 ) -> bool {
-    let (h, s, v) = hsv_from_rgb(pixel[0], pixel[1], pixel[2]);
+    // The same values as hsv_from_rgb; the hue only when it can matter.
     let alpha = pixel[3] as f32 / 255.0;
-    alpha >= 0.5
-        && hue_in_range(h, hue_range.0, hue_range.1)
-        && s >= min_saturation
+    if alpha < 0.5 {
+        return false;
+    }
+    let (s, v) = saturation_value(pixel[0], pixel[1], pixel[2]);
+    s >= min_saturation
         && v >= min_value
+        && hue_in_range(
+            hsv_from_rgb(pixel[0], pixel[1], pixel[2]).0,
+            hue_range.0,
+            hue_range.1,
+        )
 }
 
 /// Does this pixel plausibly belong to rendered UI text?
@@ -58,13 +65,27 @@ pub fn is_color_pixel(
 /// UI text is bright, fairly desaturated, and opaque; the thresholds were
 /// tuned against real interface captures.
 pub fn is_text_pixel(pixel: &Rgba<u8>) -> bool {
-    let (_, s, v) = hsv_from_rgb(pixel[0], pixel[1], pixel[2]);
     let brightness =
         0.299 * (pixel[0] as f32) + 0.587 * (pixel[1] as f32) + 0.114 * (pixel[2] as f32);
-    let is_bright = brightness >= 90.0;
+    if !alpha_is_high(pixel) || brightness < 90.0 {
+        return false;
+    }
+    let (s, v) = saturation_value(pixel[0], pixel[1], pixel[2]);
     let is_desaturated = s <= 0.55;
     let is_light = v >= 0.45;
-    alpha_is_high(pixel) && is_bright && is_desaturated && is_light
+    is_desaturated && is_light
+}
+
+/// The saturation and value `hsv_from_rgb` returns, without the hue.
+fn saturation_value(r: u8, g: u8, b: u8) -> (f32, f32) {
+    let rf = r as f32 / 255.0;
+    let gf = g as f32 / 255.0;
+    let bf = b as f32 / 255.0;
+    let max = rf.max(gf).max(bf);
+    let min = rf.min(gf).min(bf);
+    let delta = max - min;
+    let s = if max == 0.0 { 0.0 } else { delta / max };
+    (s.clamp(0.0, 1.0), max.clamp(0.0, 1.0))
 }
 
 /// Is this pixel opaque enough to be foreground rather than a blend edge?
@@ -74,6 +95,19 @@ fn alpha_is_high(pixel: &Rgba<u8>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn saturation_value_matches_the_full_conversion() {
+        use super::*;
+        for r in (0..=255u8).step_by(3) {
+            for g in (0..=255u8).step_by(3) {
+                for b in (0..=255u8).step_by(3) {
+                    let (_, s, v) = hsv_from_rgb(r, g, b);
+                    assert_eq!(saturation_value(r, g, b), (s, v), "{r} {g} {b}");
+                }
+            }
+        }
+    }
+
     use super::*;
 
     #[test]

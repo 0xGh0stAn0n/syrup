@@ -24,11 +24,15 @@ impl Provider for Qr {
     }
 
     fn detect(&self, view: &ViewRef<'_>) -> Result<Detections> {
-        let grey = image::DynamicImage::ImageRgba8(view.to_rgba()).to_luma8();
+        let rgba = view.to_rgba();
+        // Rec. 709 luma, as image's to_luma8 computes it.
         let mut prepared = rqrr::PreparedImage::prepare_from_greyscale(
-            grey.width() as usize,
-            grey.height() as usize,
-            |x, y| grey.get_pixel(x as u32, y as u32)[0],
+            view.width as usize,
+            view.height as usize,
+            |x, y| {
+                let p = rgba.get_pixel(x as u32, y as u32);
+                ((2126 * p[0] as u32 + 7152 * p[1] as u32 + 722 * p[2] as u32) / 10000) as u8
+            },
         );
         let mut out = Detections::default();
         for grid in prepared.detect_grids() {

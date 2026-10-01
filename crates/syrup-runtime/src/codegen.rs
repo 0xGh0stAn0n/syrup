@@ -8,7 +8,7 @@ use crate::error::{ErrorKind, Result, Stage, SyrupError};
 use crate::intent::{Intent, OrderKey, RegionSpec};
 use crate::plan::{Plan, Step};
 
-pub const CODEGEN_VERSION: u32 = 2;
+pub const CODEGEN_VERSION: u32 = 3;
 
 pub const EXPORTS: [&str; 3] = ["syrup_op_abi_version", "syrup_op_plan_hash", "syrup_op_run"];
 
@@ -167,14 +167,23 @@ fn detect(host: &SyrupHost, capability: u32, window: &Window) -> Result<Vec<Syru
             }
             Helper::Color => {
                 r#"
-// The same arithmetic as syrup::color::hsv_from_rgb.
-fn hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+// The same arithmetic as syrup::color::hsv_from_rgb, stopping early: the
+// hue (a division) is only worked out for pixels saturated and bright
+// enough to need it.
+fn hue_if(r: u8, g: u8, b: u8, min_s: f32, min_v: f32) -> Option<f32> {
     let rf = r as f32 / 255.0;
     let gf = g as f32 / 255.0;
     let bf = b as f32 / 255.0;
     let max = rf.max(gf).max(bf);
+    if max.clamp(0.0, 1.0) < min_v {
+        return None;
+    }
     let min = rf.min(gf).min(bf);
     let delta = max - min;
+    let s = if max == 0.0 { 0.0 } else { delta / max };
+    if s.clamp(0.0, 1.0) < min_s {
+        return None;
+    }
     let h = if delta == 0.0 {
         0.0
     } else if max == rf {
@@ -184,9 +193,7 @@ fn hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
     } else {
         60.0 * ((rf - gf) / delta + 4.0)
     };
-    let h = if h < 0.0 { h + 360.0 } else { h };
-    let s = if max == 0.0 { 0.0 } else { delta / max };
-    (h, s.clamp(0.0, 1.0), max.clamp(0.0, 1.0))
+    Some(if h < 0.0 { h + 360.0 } else { h })
 }
 
 fn row(window: &Window, y: u32) -> Result<&[u8], i32> {
@@ -397,6 +404,40 @@ fn tie_break(a: &SyrupDetection, b: &SyrupDetection) -> core::cmp::Ordering {
         .then(a.h.total_cmp(&b.h))
         .then(a.w.total_cmp(&b.w))
 }
+
+// A stable merge sort: the standard library's sort is far more code for
+// rustc to optimise, and these lists are short.
+fn sort(v: &mut Vec<SyrupDetection>, cmp: impl Fn(&SyrupDetection, &SyrupDetection) -> core::cmp::Ordering) {
+    let n = v.len();
+    let mut from = v.clone();
+    let mut to = v.clone();
+    let mut width = 1;
+    while width < n {
+        let mut start = 0;
+        while start < n {
+            let (mid, end) = ((start + width).min(n), (start + 2 * width).min(n));
+            let (mut i, mut j, mut k) = (start, mid, start);
+            while i < mid && j < end {
+                // Take from the right run only when strictly smaller, so equal items keep their order.
+                if cmp(&from[j], &from[i]) == core::cmp::Ordering::Less {
+                    to[k] = from[j];
+                    j += 1;
+                } else {
+                    to[k] = from[i];
+                    i += 1;
+                }
+                k += 1;
+            }
+            to[k..k + mid - i].copy_from_slice(&from[i..mid]);
+            k += mid - i;
+            to[k..k + end - j].copy_from_slice(&from[j..end]);
+            start = end;
+        }
+        core::mem::swap(&mut from, &mut to);
+        width *= 2;
+    }
+    *v = from;
+}
 "#
             }
             Helper::Emit => {
@@ -495,7 +536,7 @@ pub fn generate(plan: &Plan, intent: &Intent, plan_hash: &str) -> String {
                 let hue_test = if lo <= hi {
                     format!("h >= {lo:?} && h <= {hi:?}")
                 } else {
-                    format!("(h >= {lo:?} || h <= {hi:?})")
+                    format!("h >= {lo:?} || h <= {hi:?}")
                 };
                 let (sat, val) = (
                     min_saturation_pct as f32 / 100.0,
@@ -504,8 +545,7 @@ pub fn generate(plan: &Plan, intent: &Intent, plan_hash: &str) -> String {
                 let _ = write!(
                     predicates,
                     "\nfn matches_v{i}(r: u8, g: u8, b: u8, a: u8) -> bool {{\n    \
-                     let (h, s, v) = hsv(r, g, b);\n    \
-                     a as f32 / 255.0 >= 0.5 && {hue_test} && s >= {sat:?} && v >= {val:?}\n}}\n"
+                     a as f32 / 255.0 >= 0.5 && hue_if(r, g, b, {sat:?}, {val:?}).is_some_and(|h| {hue_test})\n}}\n"
                 );
                 let _ = writeln!(
                     b,
@@ -562,11 +602,11 @@ pub fn generate(plan: &Plan, intent: &Intent, plan_hash: &str) -> String {
                     Some(primary) => {
                         let _ = writeln!(
                             b,
-                            "    v{i}.sort_by(|a, b| {primary}.then_with(|| tie_break(a, b)));"
+                            "    sort(&mut v{i}, |a, b| {primary}.then_with(|| tie_break(a, b)));"
                         );
                     }
                     None => {
-                        let _ = writeln!(b, "    v{i}.sort_by(tie_break);");
+                        let _ = writeln!(b, "    sort(&mut v{i}, tie_break);");
                     }
                 }
             }

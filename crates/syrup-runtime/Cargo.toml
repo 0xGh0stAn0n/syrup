@@ -27,7 +27,12 @@ syrup = { path = "../.." }
 tract-onnx = { version = "0.23", optional = true }
 
 [dev-dependencies]
+criterion = "0.5"
 qrcode = { version = "0.14", default-features = false }
+
+[[bench]]
+name = "runtime"
+harness = false
 
 [[bin]]
 name = "syrup"
