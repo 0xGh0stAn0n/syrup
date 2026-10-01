@@ -106,10 +106,15 @@ def test_compositions_restore_coordinates():
     assert len(ops.find_faces_by_size(image, max_results=1)) == 1
     assert not ops.find_faces_in_top_right(image)
 
-    with pytest.raises(syrup.InputError):
-        ops.find_faces_in_region(image)
-    with pytest.raises(syrup.InputError):
-        ops.find_faces(image, min_confidence=2.0)
+    for name, kwargs in [
+        ("find_faces_in_region", {}),
+        ("find_faces_in_region", {"region": (1.5, 0, 2, 2)}),
+        ("find_faces", {"min_confidence": 2.0}),
+        ("find_faces", {"max_results": -1}),
+        ("find_faces", {"region": (0, 0, 2, 2)}),
+    ]:
+        with pytest.raises(syrup.InputError):
+            getattr(ops, name)(image, **kwargs)
 
 
 def test_define_gives_other_names_a_meaning():

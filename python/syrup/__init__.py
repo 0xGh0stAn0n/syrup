@@ -12,6 +12,7 @@ the result contract and every way an operation can fail.
 """
 
 import json
+import operator
 import os
 
 from . import _native
@@ -106,6 +107,16 @@ def _pixels(image):
     )
 
 
+def _ints(values, count, message, operation):
+    try:
+        values = tuple(operator.index(v) for v in values)
+    except TypeError:
+        values = ()
+    if len(values) != count or min(values) < 0:
+        raise InputError("input", "bad_parameter", message, operation)
+    return values
+
+
 class Operation:
     """A resolved operation. Call it with an image to run it."""
 
@@ -139,9 +150,9 @@ class Operation:
     def __call__(self, image, *, min_confidence=None, max_results=None, region=None):
         pixels, width, height, channels = _pixels(image)
         if region is not None:
-            if len(region) != 4 or not all(isinstance(v, int) and v >= 0 for v in region):
-                raise InputError("input", "bad_parameter", "region must be four non-negative ints (x, y, w, h)", self.name)
-            region = tuple(region)
+            region = _ints(region, 4, "region must be four non-negative ints (x, y, w, h)", self.name)
+        if max_results is not None:
+            (max_results,) = _ints([max_results], 1, "max_results must be a non-negative int", self.name)
         result = _call(self._native.run, pixels, width, height, channels, min_confidence, max_results, region)
         return from_json(result)
 
