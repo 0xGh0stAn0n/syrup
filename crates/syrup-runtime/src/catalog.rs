@@ -84,6 +84,14 @@ pub fn entry_for_capability(capability: Capability) -> &'static TargetEntry {
         .expect("every capability is in the catalog")
 }
 
+/// A target by any of its nouns, e.g. `face` or `human_faces`.
+pub fn target_named(noun: &str) -> Option<Target> {
+    TARGETS
+        .iter()
+        .find(|e| e.singular.contains(&noun) || e.plural.contains(&noun))
+        .map(|e| e.target)
+}
+
 pub fn known_targets() -> String {
     TARGETS
         .iter()

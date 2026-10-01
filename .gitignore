@@ -8,3 +8,8 @@
 Thumbs.db
 
 *.log
+
+/crates/syrup-python/target/
+/python/syrup/_native*
+__pycache__/
+.pytest_cache/

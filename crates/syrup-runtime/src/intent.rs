@@ -164,6 +164,20 @@ pub enum OrderKey {
 }
 
 impl OrderKey {
+    /// Accepts the serialized names and the grammar's `by_` keys.
+    pub fn parse(word: &str) -> Option<OrderKey> {
+        Some(match word {
+            "confidence_desc" | "confidence" | "score" => OrderKey::ConfidenceDesc,
+            "area_desc" | "area" | "size" => OrderKey::AreaDesc,
+            "area_asc" => OrderKey::AreaAsc,
+            "left_to_right" => OrderKey::LeftToRight,
+            "right_to_left" => OrderKey::RightToLeft,
+            "top_to_bottom" => OrderKey::TopToBottom,
+            "bottom_to_top" => OrderKey::BottomToTop,
+            _ => return None,
+        })
+    }
+
     pub fn describe(self) -> &'static str {
         match self {
             OrderKey::ConfidenceDesc => "confidence, highest first",
@@ -440,6 +454,17 @@ const UNSUPPORTED_QUALIFIERS: &[&str] = &[
 const NUMBER_WORDS: &[&str] = &[
     "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
 ];
+
+/// A region by its grammar name, e.g. `top_half` or `region`.
+pub fn region_named(name: &str) -> Option<RegionSpec> {
+    if name == "region" {
+        return Some(RegionSpec::Caller);
+    }
+    NAMED_REGIONS
+        .iter()
+        .find(|(names, _)| names.contains(&name))
+        .map(|(_, rect)| RegionSpec::Fixed { rect: rect() })
+}
 
 pub fn grammar_summary() -> String {
     let regions: Vec<&str> = NAMED_REGIONS.iter().map(|(names, _)| names[0]).collect();
