@@ -129,7 +129,7 @@ def test_define_gives_other_names_a_meaning():
         syrup.define("find_face", find="face", region="top_half")
     assert e.value.kind == "conflicting"
     with pytest.raises(syrup.IntentError):
-        syrup.define("cars", find="cars")
+        syrup.define("unicorns", find="unicorns")
     with pytest.raises(syrup.IntentError):
         syrup.define("faces_in_nowhere", find="face", region=(0.5, 0, 0.6, 1))
 

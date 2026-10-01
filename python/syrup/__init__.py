@@ -219,7 +219,7 @@ def define(
     return Operation(_call(_native.define, name, json.dumps(spec)))
 
 
-def add_target(noun, detect, *, plural=None, min_confidence=0.5):
+def add_target(noun, detect, *, plural=None, min_confidence=0.5, provider="python", model_sha256=None):
     """Find `noun` with your own detector, e.g. a model from any Python library.
 
     `detect(image)` gets the searched pixels as a uint8 NumPy array (H, W, C)
@@ -227,6 +227,7 @@ def add_target(noun, detect, *, plural=None, min_confidence=0.5):
     (x, y, w, h, score, text), with score in [0, 1]. Names can then use the
     noun like any other: syrup.ops.find_largest_<noun>_in_center. Regions,
     ordering and limits run in the compiled module around the detector.
+    `provider` and `model_sha256` are what provenance reports for it.
     """
     import numpy as np
 
@@ -234,7 +235,7 @@ def add_target(noun, detect, *, plural=None, min_confidence=0.5):
         image = np.frombuffer(pixels, np.uint8).reshape(height, width, channels)
         return [_detection(box) for box in detect(image)]
 
-    _call(_native.add_target, noun, plural or noun + "s", float(min_confidence), call)
+    _call(_native.add_target, noun, plural or noun + "s", float(min_confidence), call, provider, model_sha256)
 
 
 def _detection(box):

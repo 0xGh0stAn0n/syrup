@@ -19,6 +19,8 @@ classifiers = [
 [project.optional-dependencies]
 test = ["pytest", "numpy", "pillow"]
 planner = ["anthropic"]
+yolo = ["numpy", "ultralytics"]
+mediapipe = ["numpy", "mediapipe"]
 
 [tool.maturin]
 manifest-path = "../crates/syrup-python/Cargo.toml"

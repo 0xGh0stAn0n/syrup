@@ -271,6 +271,9 @@ fn define(name: &str, spec: &str) -> PyResult<NativeOperation> {
 /// host like any other provider.
 struct PythonDetector {
     name: &'static str,
+    /// What provenance calls the detector, e.g. the model it runs.
+    provider: &'static str,
+    model_sha256: Option<String>,
     detect: Py<PyAny>,
 }
 
@@ -280,8 +283,8 @@ impl Provider for PythonDetector {
     fn info(&self) -> ProviderInfo {
         ProviderInfo {
             capability: self.name,
-            name: "python",
-            model_sha256: None,
+            name: self.provider,
+            model_sha256: self.model_sha256.clone(),
             runtime: "python",
         }
     }
@@ -324,14 +327,22 @@ impl Provider for PythonDetector {
 }
 
 #[pyfunction]
+#[pyo3(signature = (singular, plural, min_confidence, detect, provider="python", model_sha256=None))]
 fn add_target(
     singular: &str,
     plural: &str,
     min_confidence: f32,
     detect: Py<PyAny>,
+    provider: &str,
+    model_sha256: Option<String>,
 ) -> PyResult<()> {
-    let name: &'static str = Box::leak(singular.to_string().into_boxed_str());
-    let detector = Arc::new(PythonDetector { name, detect });
+    let leak = |s: &str| -> &'static str { Box::leak(s.to_string().into_boxed_str()) };
+    let detector = Arc::new(PythonDetector {
+        name: leak(singular),
+        provider: leak(provider),
+        model_sha256,
+        detect,
+    });
     syrup_runtime::custom::add_target(singular, plural, min_confidence, detector)
         .map(|_| ())
         .map_err(raise)

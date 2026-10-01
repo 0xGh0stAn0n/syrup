@@ -62,3 +62,24 @@ jobs:
         run: pip install "./python[test]" opencv-python-headless
       - name: Test
         run: pytest python/tests
+
+  # The model recipes, on real photographs. Heavy dependencies, so a job of
+  # their own; elsewhere these tests skip.
+  recipes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/syrup-python -> target
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: |
+          sudo apt-get update && sudo apt-get install -y libegl1 libgles2
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install "./python[test,yolo,mediapipe]"
+      - name: Test
+        run: pytest python/tests/test_recipes.py -v

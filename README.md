@@ -56,6 +56,18 @@ syrup.add_target("licence_plate", my_plate_detector)   # e.g. a YOLO model, Open
 plates = syrup.ops.find_licence_plates_in_bottom_half_left_to_right("street.jpg")
 ```
 
+Ready-made recipes register whole model vocabularies at once, with model
+files downloaded into the cache and checked against pinned hashes:
+
+```python
+import syrup.recipes
+
+syrup.recipes.yolo()                 # pip install syrup-cv[yolo]: COCO's 80 classes
+syrup.recipes.mediapipe_poses()      # pip install syrup-cv[mediapipe]
+cups = syrup.ops.find_cups_left_to_right("table.jpg")
+people = syrup.ops.track_people.session()
+```
+
 For names outside the grammar, `syrup.define` takes the meaning
 explicitly, and the optional planner asks Claude for it, constrained to
 Syrup's vocabulary and checked like any other definition:

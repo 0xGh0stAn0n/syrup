@@ -13,6 +13,14 @@ What every `find_*` operation honours, whichever name or language reached it.
 | `syrup.planner.plan("find_header_faces", "faces in the top fifth")` asks Claude for `define`'s arguments when the grammar does not cover a name | on the call | on first call |
 | Rust: `Runtime::resolve` / `Runtime::define` | on the call | on first `run`, or `prepare()` |
 
+`syrup.recipes` registers whole vocabularies with `add_target`:
+`yolo()` (Ultralytics, COCO's classes by default), `mediapipe_objects()`
+(EfficientDet-Lite0) and `mediapipe_poses()` (`pose`/`poses`). Labels
+become nouns with plurals (`traffic light` -> `traffic_light`,
+`traffic_lights`); labels that would change what a name means, such as
+COCO's `orange`, are skipped and reported unless renamed. Provenance names
+the model and its SHA-256.
+
 The planner is optional (`pip install syrup-cv[planner]`). The model may
 only answer with values from Syrup's own vocabulary, which the request's
 JSON schema enumerates, or refuse as ambiguous or unsupported; it never
