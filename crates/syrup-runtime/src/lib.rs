@@ -27,6 +27,7 @@ mod compiler;
 pub mod contract;
 pub mod custom;
 pub mod error;
+pub mod frames;
 mod host;
 pub mod intent;
 pub mod interp;

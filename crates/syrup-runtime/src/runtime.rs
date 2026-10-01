@@ -12,6 +12,7 @@ use crate::codegen;
 use crate::compiler::{HOST_TARGET, Rustc};
 use crate::contract::*;
 use crate::error::{ErrorKind, Result, Stage, SyrupError};
+use crate::frames::FrameSource;
 use crate::host::{ExecHost, well_formed};
 use crate::intent::{self, Intent, PixelRect};
 use crate::loader::Module;
@@ -725,6 +726,21 @@ pub struct Session {
 impl Session {
     pub fn operation(&self) -> &Operation {
         &self.op
+    }
+
+    /// Runs the next frame from `source`; `None` once the source has ended.
+    pub fn next(
+        &mut self,
+        source: &mut dyn FrameSource,
+        params: &RunParams,
+    ) -> Result<Option<FindResult>> {
+        let frame = source
+            .next_frame()
+            .map_err(|e| e.for_operation(&self.op.name))?;
+        match frame {
+            Some(frame) => self.update(&frame.as_input()?, params).map(Some),
+            None => Ok(None),
+        }
     }
 
     /// Objects seen in this frame. Ids of objects missing for a few frames

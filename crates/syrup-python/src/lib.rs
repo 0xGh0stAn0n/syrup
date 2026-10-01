@@ -12,6 +12,7 @@ use pyo3::types::PyBytes;
 use serde::Deserialize;
 use syrup_runtime::abi::SyrupDetection;
 use syrup_runtime::contract::ProviderInfo;
+use syrup_runtime::frames::{FrameSource, WindowCapture};
 use syrup_runtime::intent::{region_named, region_names};
 use syrup_runtime::providers::{Detections, Provider, ViewRef};
 use syrup_runtime::{
@@ -372,6 +373,23 @@ fn vocabulary() -> String {
 }
 
 #[pyfunction]
+fn list_windows() -> Vec<String> {
+    WindowCapture::windows()
+}
+
+/// One frame of the first window whose title contains `title`.
+#[pyfunction]
+fn capture_window(py: Python<'_>, title: &str) -> PyResult<(Py<PyBytes>, u32, u32, u32)> {
+    let mut window = WindowCapture::new(title).map_err(raise)?;
+    let frame = py
+        .detach(|| window.next_frame())
+        .map_err(raise)?
+        .expect("a window's first capture either succeeds or fails");
+    let data = PyBytes::new(py, &frame.data).unbind();
+    Ok((data, frame.width, frame.height, frame.channels))
+}
+
+#[pyfunction]
 fn cache_dir() -> PyResult<PathBuf> {
     Ok(runtime()?.store().root().to_path_buf())
 }
@@ -387,6 +405,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decode_image, m)?)?;
     m.add_function(wrap_pyfunction!(bundle, m)?)?;
     m.add_function(wrap_pyfunction!(vocabulary, m)?)?;
+    m.add_function(wrap_pyfunction!(list_windows, m)?)?;
+    m.add_function(wrap_pyfunction!(capture_window, m)?)?;
     m.add_function(wrap_pyfunction!(cache_dir, m)?)?;
     Ok(())
 }

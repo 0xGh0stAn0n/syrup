@@ -238,3 +238,18 @@ def test_sessions_follow_objects_across_frames():
         syrup.ops.track_faces(photo)
     with pytest.raises(syrup.InputError):
         syrup.ops.find_faces.session()
+
+
+def test_layout_targets_and_frame_sources():
+    page = PILImage.open(FIXTURES / "words.png")
+    (block,) = syrup.ops.find_text_blocks(page)
+    assert block.label == "text_block" and block.box.w > 100
+
+    if sys.platform == "win32":
+        assert isinstance(syrup.capture.windows(), list)
+        with pytest.raises(syrup.InputError):
+            next(syrup.capture.window("no window is called this 7f3a"))
+    else:
+        assert syrup.capture.windows() == []
+        with pytest.raises(syrup.DependencyError):
+            next(syrup.capture.window("anything"))

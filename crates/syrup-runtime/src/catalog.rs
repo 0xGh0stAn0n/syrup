@@ -28,6 +28,8 @@ pub enum Target {
     /// What changed since the previous frame; only sessions see frames.
     MovingRegion,
     QrCode,
+    TextBlock,
+    Panel,
     /// The searched image or region as one item; only measurements use it.
     Image,
     Custom(Name),
@@ -67,6 +69,8 @@ pub enum Capability {
     TextRecognition,
     Motion,
     QrDecoding,
+    TextBlocks,
+    Panels,
     Custom(Name),
 }
 
@@ -79,6 +83,8 @@ impl Capability {
             Capability::TextRecognition => abi::SYRUP_CAP_TEXT,
             Capability::Motion => abi::SYRUP_CAP_MOTION,
             Capability::QrDecoding => abi::SYRUP_CAP_QR,
+            Capability::TextBlocks => abi::SYRUP_CAP_TEXT_BLOCKS,
+            Capability::Panels => abi::SYRUP_CAP_PANELS,
             Capability::Custom(name) => custom_id(name.as_str()),
         }
     }
@@ -89,6 +95,8 @@ impl Capability {
             abi::SYRUP_CAP_TEXT => Some(Capability::TextRecognition),
             abi::SYRUP_CAP_MOTION => Some(Capability::Motion),
             abi::SYRUP_CAP_QR => Some(Capability::QrDecoding),
+            abi::SYRUP_CAP_TEXT_BLOCKS => Some(Capability::TextBlocks),
+            abi::SYRUP_CAP_PANELS => Some(Capability::Panels),
             id => custom::entries().into_iter().find_map(|e| match e.finder {
                 Finder::Detect(c @ Capability::Custom(_)) if c.abi_id() == id => Some(c),
                 _ => None,
@@ -102,6 +110,8 @@ impl Capability {
             Capability::TextRecognition => "text_recognition",
             Capability::Motion => "motion",
             Capability::QrDecoding => "qr_decoding",
+            Capability::TextBlocks => "text_blocks",
+            Capability::Panels => "panels",
             Capability::Custom(name) => name.as_str(),
         }
     }
@@ -301,6 +311,28 @@ pub const TARGETS: &[TargetEntry] = &[
         // rqrr's order, in the code's own orientation.
         keypoints: &["top_left", "top_right", "bottom_right", "bottom_left"],
         description: "QR codes, with what they say",
+    },
+    TargetEntry {
+        target: Target::TextBlock,
+        label: "text_block",
+        singular: &["text_block"],
+        plural: &["text_blocks"],
+        finder: Finder::Detect(Capability::TextBlocks),
+        // Confidence is the share of the block's pixels that look like text.
+        default_min_confidence: 0.0,
+        keypoints: &[],
+        description: "the block of text-like pixels in the searched region, at most one per region",
+    },
+    TargetEntry {
+        target: Target::Panel,
+        label: "panel",
+        singular: &["panel"],
+        plural: &["panels"],
+        finder: Finder::Detect(Capability::Panels),
+        // Confidence is the share of the panel's pixels in its colour.
+        default_min_confidence: 0.0,
+        keypoints: &[],
+        description: "the largest panel of the searched region's dominant colour, at most one per region",
     },
     TargetEntry {
         target: Target::MovingRegion,

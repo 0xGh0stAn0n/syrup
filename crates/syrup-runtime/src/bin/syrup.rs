@@ -2,7 +2,10 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use image::Rgba;
-use syrup_runtime::{FindResult, OwnedImage, PixelRect, RunParams, Runtime, SyrupError};
+use syrup_runtime::frames::{FrameSource, ImageFiles, WindowCapture};
+use syrup_runtime::{
+    FindResult, OwnedImage, PixelRect, RunParams, Runtime, SessionOptions, SyrupError,
+};
 
 const USAGE: &str = "usage:
   syrup explain <operation>
@@ -10,6 +13,8 @@ const USAGE: &str = "usage:
   syrup prepare <operation>...
   syrup bundle <dir> <operation>...
   syrup run <operation> <image> [--min-confidence F] [--max-results N] [--region X,Y,W,H] [--draw OUT]
+  syrup watch <track_operation> (--window TITLE [--frames N] | <image>...)
+  syrup windows
   syrup cache [path|list|clear]";
 
 enum Failure {
@@ -114,6 +119,45 @@ fn run(args: &[String]) -> Result<(), Failure> {
                 annotate(&image, &result)
                     .save(&out)
                     .map_err(|e| usage(&format!("cannot write {out}: {e}")))?;
+            }
+        }
+        Some("watch") => {
+            let op = runtime.resolve(arg(args, 1)?)?;
+            let mut session = op.session(SessionOptions::default())?;
+            let rest = &args[2..];
+            let (mut source, limit): (Box<dyn FrameSource>, Option<u64>) = match rest {
+                [flag, title, more @ ..] if flag == "--window" => {
+                    let limit = match more {
+                        [] => None,
+                        [flag, n] if flag == "--frames" => Some(
+                            n.parse()
+                                .map_err(|_| usage(&format!("bad value for --frames: {n}")))?,
+                        ),
+                        _ => return Err(usage("watch --window TITLE takes only --frames N")),
+                    };
+                    (Box::new(WindowCapture::new(title)?), limit)
+                }
+                [] => return Err(usage("watch needs --window TITLE or image files")),
+                files => (
+                    Box::new(ImageFiles::new(files.iter().map(Into::into))),
+                    None,
+                ),
+            };
+            let mut seen = 0;
+            while limit.is_none_or(|limit| seen < limit) {
+                let Some(result) = session.next(source.as_mut(), &RunParams::default())? else {
+                    break;
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string(&result).expect("results serialize")
+                );
+                seen += 1;
+            }
+        }
+        Some("windows") => {
+            for title in WindowCapture::windows() {
+                println!("{title}");
             }
         }
         Some("cache") => match args.get(1).map(String::as_str) {

@@ -39,7 +39,8 @@ blurry = [w for w in measure_sharpness_of_words(frame) if w.value < 0.35]
 ```
 
 Video goes through sessions, which keep ids across frames with the core's
-tracker:
+tracker. On Windows, `syrup.capture.window("title")` yields a live window's
+frames:
 
 ```python
 session = syrup.ops.track_moving_regions_in_top_half.session()

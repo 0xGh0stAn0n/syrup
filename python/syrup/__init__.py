@@ -51,6 +51,7 @@ __all__ = [
     "add_target",
     "bundle",
     "cache_dir",
+    "capture",
     "define",
     "ops",
     "resolve",
@@ -257,4 +258,4 @@ def cache_dir():
     return _call(_native.cache_dir)
 
 
-from . import ops  # noqa: E402  (ops needs resolve, defined above)
+from . import capture, ops  # noqa: E402  (they need the names above)

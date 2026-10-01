@@ -36,7 +36,7 @@ quantity  := sharpness | fill
 verb      := find | detect | locate
 target    := face | faces | human_face | human_faces | word | words
            | region | regions | blob | blobs | bar | bars
-           | qr_code | qr_codes
+           | qr_code | qr_codes | text_block | text_blocks | panel | panels
            | moving_region | moving_regions | moving_blob | moving_blobs
 colour    := red | orange | yellow | green | cyan | blue | purple | violet | magenta
 selector  := largest | biggest | smallest | leftmost | rightmost | topmost | bottommost | most_confident
@@ -53,7 +53,12 @@ Faces come from YuNet, words from Tesseract, QR codes from rqrr (decoded
 codes score 1, codes found but unreadable 0.5, below the default 0.6;
 `text` is the content and the keypoints are the corners `top_left`,
 `top_right`, `bottom_right`, `bottom_left` in the code's own orientation),
-and nouns added with
+text blocks and panels from the core's layout helpers (`find_text_block`:
+the padded bounds of text-like pixels; `find_uniform_color_panel`: the
+largest rectangle of the searched region's dominant colour, quantised to
+32 levels per channel; at most one of each per searched region, scored by
+the share of their pixels that are text or the panel's colour), and nouns
+added with
 `add_target` from their own detector, which receives the searched pixels
 and returns `(x, y, w, h, score[, text])` boxes in them; the compiled
 module does the rest. Added nouns may not use words the grammar already
@@ -117,7 +122,14 @@ grouped into regions of at least 24 pixels, scored by the share of the box
 that changed. A moving object shows up as the area it left and the area it
 entered, and nothing moves in a session's first frame. They exist only in
 sessions (`find_moving_regions` is refused), and changing the session's
-`region` starts the comparison over.
+`region` starts the comparison over. A frame that fails leaves the session
+as it was.
+
+Frames can come from a source instead of the caller: image files
+(`frames::ImageFiles`, `syrup watch <op> <files>...`), or on Windows a live
+window (`frames::WindowCapture`, `syrup watch <op> --window TITLE`,
+`syrup.capture.window(title)`), captured with the core's `capture` module
+until it closes. Elsewhere window capture is a `DependencyError`.
 
 Singular and plural mean the same: `find_face` returns every face, so
 `faces = find_face(img)` reads right. One result is spelled with a selector:

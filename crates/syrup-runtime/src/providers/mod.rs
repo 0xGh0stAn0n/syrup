@@ -1,5 +1,6 @@
 //! Capabilities the host offers generated modules.
 
+pub mod layout;
 pub mod motion;
 pub mod qr;
 pub mod tesseract;
@@ -103,6 +104,8 @@ pub struct Providers {
     face: Arc<dyn Provider>,
     text: Arc<dyn Provider>,
     qr: Arc<dyn Provider>,
+    text_blocks: Arc<dyn Provider>,
+    panels: Arc<dyn Provider>,
 }
 
 impl Providers {
@@ -118,6 +121,8 @@ impl Providers {
             face,
             text: Arc::new(tesseract::Tesseract),
             qr: Arc::new(qr::Qr),
+            text_blocks: Arc::new(layout::TextBlocks),
+            panels: Arc::new(layout::Panels),
         }
     }
 
@@ -126,6 +131,8 @@ impl Providers {
             Capability::FaceDetection => Ok(self.face.clone()),
             Capability::TextRecognition => Ok(self.text.clone()),
             Capability::QrDecoding => Ok(self.qr.clone()),
+            Capability::TextBlocks => Ok(self.text_blocks.clone()),
+            Capability::Panels => Ok(self.panels.clone()),
             Capability::Motion => Err(SyrupError::new(
                 Stage::Execute,
                 ErrorKind::BadParameter,
