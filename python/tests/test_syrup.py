@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import sys
 
@@ -168,3 +169,26 @@ except syrup.SyrupError as e:
     assert missing == "DependencyError compile missing_dependency"
     frozen = python(code, SYRUP_CACHE_DIR=str(tmp_path / "b"), SYRUP_MODE="frozen")
     assert frozen == "LoadError load not_prepared"
+
+
+@pytest.mark.skipif(shutil.which("tesseract") is None, reason="Tesseract is not installed")
+def test_words_carry_their_text():
+    words = syrup.ops.find_words_left_to_right(FIXTURES / "words.png")
+    assert [w.text for w in words if w.box.y > 150] == ["HELLO", "WORLD"]
+    assert all(w.label == "word" and w.confidence > 0.9 for w in words)
+    assert syrup.ops.find_face(ASTRONAUT)[0].text is None
+
+
+def test_colour_regions_are_found_in_arrays():
+    image = np.full((60, 80, 3), 120, np.uint8)
+    image[40:46, 10:50] = (220, 30, 30)
+    image[5:20, 60:75] = (30, 60, 220)
+    (bar,) = syrup.ops.find_red_bars(image)
+    assert (bar.box, bar.label, bar.confidence) == (syrup.Box(10, 40, 40, 6), "bar", 1.0)
+    (blue,) = syrup.ops.find_blue_regions_in_top_half(image)
+    assert blue.box == syrup.Box(60, 5, 15, 15)
+    assert not syrup.ops.find_green_regions(image)
+    with pytest.raises(syrup.IntentError) as e:
+        syrup.ops.find_regions
+    assert e.value.kind == "ambiguous"
+    assert syrup.define("alarm_bars", find="bars", color="red").plan_hash == syrup.resolve("find_red_bars").plan_hash

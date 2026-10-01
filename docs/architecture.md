@@ -45,7 +45,10 @@ from syrup.ops import find_face        Runtime::resolve("find_face")
 
 1. **The generated module is the operation.** Region selection, the detector
    call, coordinate restoration, clipping, filtering, ordering and limiting
-   are emitted from the plan. Only the learned detector lives in the host.
+   are emitted from the plan. Only learned or external detectors (YuNet,
+   Tesseract) and the core's region grouping live in the host. For colour
+   targets the per-pixel test itself is generated, specialised to the
+   colour, and validated against the core's `is_color_pixel`.
 2. **Generated code has no dependencies.** The ONNX runtime and the model
    are compiled into the host once, so a module builds with `rustc` in about
    half a second and never downloads anything.
@@ -61,7 +64,10 @@ from syrup.ops import find_face        Runtime::resolve("find_face")
    compiles on first call. A bare name that was never imported cannot be
    intercepted honestly, so it is not attempted. Names outside the grammar
    go through `syrup.define`.
-6. **The model is a pinned dependency of the runtime.** YuNet 2023mar (MIT,
+6. **New detectors plug in without Rust.** `syrup.add_target(noun, detect)`
+   registers a Python function (any ML library) as a provider; names using
+   the noun compile to modules that call it through the same ABI.
+7. **The model is a pinned dependency of the runtime.** YuNet 2023mar (MIT,
    232 KB, SHA-256 checked) runs through `tract-onnx`: pure Rust, no OpenCV.
    The core crate stays model-free.
 

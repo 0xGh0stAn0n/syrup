@@ -9,7 +9,7 @@ use image::imageops::{self, FilterType};
 use sha2::{Digest, Sha256};
 use tract_onnx::prelude::*;
 
-use super::{ModelSource, Provider, ViewRef};
+use super::{Detections, ModelSource, Provider, ViewRef};
 use crate::abi::{SYRUP_MAX_KEYPOINTS, SyrupDetection};
 use crate::contract::ProviderInfo;
 use crate::error::{ErrorKind, Result, Stage, SyrupError};
@@ -91,7 +91,7 @@ impl Provider for YuNet {
         }
     }
 
-    fn detect(&self, view: &ViewRef<'_>) -> Result<Vec<SyrupDetection>> {
+    fn detect(&self, view: &ViewRef<'_>) -> Result<Detections> {
         let model = self.model()?;
         let scale = (CANVAS as f32 / view.width as f32).min(CANVAS as f32 / view.height as f32);
         let w = ((view.width as f32 * scale).round() as u32).clamp(1, CANVAS as u32);
@@ -166,7 +166,7 @@ impl Provider for YuNet {
 
         // Back from canvas pixels to view pixels.
         let (sx, sy) = (w as f32 / view.width as f32, h as f32 / view.height as f32);
-        Ok(nms(candidates)
+        let boxes = nms(candidates)
             .into_iter()
             .map(|mut d| {
                 (d.x, d.y, d.w, d.h) = (d.x / sx, d.y / sy, d.w / sx, d.h / sy);
@@ -176,7 +176,11 @@ impl Provider for YuNet {
                 }
                 d
             })
-            .collect())
+            .collect();
+        Ok(Detections {
+            boxes,
+            texts: vec![],
+        })
     }
 }
 

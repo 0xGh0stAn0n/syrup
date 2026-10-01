@@ -2,7 +2,7 @@
 //! bound one by one: Python passes a name and pixels, and gets JSON back.
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
@@ -10,7 +10,10 @@ use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::PyBytes;
 use serde::Deserialize;
+use syrup_runtime::abi::SyrupDetection;
+use syrup_runtime::contract::ProviderInfo;
 use syrup_runtime::intent::region_named;
+use syrup_runtime::providers::{Detections, Provider, ViewRef};
 use syrup_runtime::{
     ErrorKind, ImageInput, Intent, NormRect, Operation, OrderKey, OwnedImage, PixelRect, Ratio,
     RegionSpec, RunParams, Runtime, Stage, SyrupError, catalog,
@@ -120,6 +123,7 @@ fn resolve(name: &str) -> PyResult<NativeOperation> {
 #[serde(deny_unknown_fields)]
 struct Spec {
     find: String,
+    color: Option<String>,
     region: Option<RegionArg>,
     order: Option<String>,
     limit: Option<u32>,
@@ -144,6 +148,13 @@ fn intent_from(spec: Spec) -> Result<Intent, SyrupError> {
         )
         .with_hint(format!("known targets: {}", catalog::known_targets()))
     })?;
+    let color = match spec.color {
+        None => None,
+        Some(name) => Some(
+            catalog::color_named(&name)
+                .ok_or_else(|| malformed(format!("{name:?} is not a colour Syrup knows")))?,
+        ),
+    };
     let region = match spec.region {
         None => None,
         Some(RegionArg::Named(name)) => Some(
@@ -167,6 +178,7 @@ fn intent_from(spec: Spec) -> Result<Intent, SyrupError> {
     };
     Ok(Intent {
         target,
+        color,
         region,
         order,
         limit: spec.limit,
@@ -190,6 +202,75 @@ fn define(name: &str, spec: &str) -> PyResult<NativeOperation> {
         .map_err(raise)
 }
 
+/// A detector written in Python, called by generated modules through the
+/// host like any other provider.
+struct PythonDetector {
+    name: &'static str,
+    detect: Py<PyAny>,
+}
+
+type Found = (f32, f32, f32, f32, f32, Option<String>);
+
+impl Provider for PythonDetector {
+    fn info(&self) -> ProviderInfo {
+        ProviderInfo {
+            capability: self.name,
+            name: "python",
+            model_sha256: None,
+            runtime: "python",
+        }
+    }
+
+    fn detect(&self, view: &ViewRef<'_>) -> syrup_runtime::Result<Detections> {
+        let pixels = view.packed();
+        let found: Vec<Found> = Python::attach(|py| {
+            let pixels = PyBytes::new(py, &pixels);
+            self.detect
+                .call1(py, (pixels, view.width, view.height, view.channels))?
+                .extract(py)
+        })
+        .map_err(|e: PyErr| {
+            SyrupError::new(
+                Stage::Execute,
+                ErrorKind::ProviderFailed,
+                format!("the {} detector failed: {e}", self.name),
+            )
+        })?;
+        let with_text = found.iter().any(|f| f.5.is_some());
+        let mut out = Detections::default();
+        for (x, y, w, h, score, text) in found {
+            out.boxes.push(SyrupDetection {
+                x,
+                y,
+                w,
+                h,
+                score,
+                n_keypoints: 0,
+                keypoints: [0.0; 10],
+                payload: 0,
+            });
+            if with_text {
+                out.texts.push(text.unwrap_or_default());
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[pyfunction]
+fn add_target(
+    singular: &str,
+    plural: &str,
+    min_confidence: f32,
+    detect: Py<PyAny>,
+) -> PyResult<()> {
+    let name: &'static str = Box::leak(singular.to_string().into_boxed_str());
+    let detector = Arc::new(PythonDetector { name, detect });
+    syrup_runtime::custom::add_target(singular, plural, min_confidence, detector)
+        .map(|_| ())
+        .map_err(raise)
+}
+
 #[pyfunction]
 fn decode_image(py: Python<'_>, path: PathBuf) -> PyResult<(Py<PyBytes>, u32, u32, u32)> {
     let image = py.detach(|| OwnedImage::open(&path)).map_err(raise)?;
@@ -208,6 +289,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NativeOperation>()?;
     m.add_function(wrap_pyfunction!(resolve, m)?)?;
     m.add_function(wrap_pyfunction!(define, m)?)?;
+    m.add_function(wrap_pyfunction!(add_target, m)?)?;
     m.add_function(wrap_pyfunction!(decode_image, m)?)?;
     m.add_function(wrap_pyfunction!(cache_dir, m)?)?;
     Ok(())

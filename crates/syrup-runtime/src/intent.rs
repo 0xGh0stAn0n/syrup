@@ -5,14 +5,14 @@
 
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-use crate::catalog::{self, Target};
+use crate::catalog::{self, Color, Finder, Target};
 use crate::error::{ErrorKind, Result, Stage, SyrupError};
 
 /// An exact fraction. Regions use these so the interpreter and generated
 /// code compute identical pixel bounds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct Ratio {
     pub num: u32,
     pub den: u32,
@@ -65,7 +65,7 @@ fn gcd(a: u64, b: u64) -> u64 {
 }
 
 /// Half-open pixel rectangle `[x, x+w) × [y, y+h)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct PixelRect {
     pub x: u32,
     pub y: u32,
@@ -74,7 +74,7 @@ pub struct PixelRect {
 }
 
 /// A rectangle as fractions of the image size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct NormRect {
     pub x: Ratio,
     pub y: Ratio,
@@ -132,7 +132,7 @@ impl fmt::Display for NormRect {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RegionSpec {
     Fixed {
@@ -151,7 +151,7 @@ impl fmt::Display for RegionSpec {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrderKey {
     ConfidenceDesc,
@@ -193,9 +193,11 @@ impl OrderKey {
 
 /// What an operation means. Names that resolve to the same intent are the
 /// same operation and share one compiled artifact.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct Intent {
     pub target: Target,
+    /// Required by targets found by colour, refused by the others.
+    pub color: Option<Color>,
     pub region: Option<RegionSpec>,
     pub order: OrderKey,
     pub limit: Option<u32>,
@@ -208,6 +210,7 @@ impl Intent {
     pub fn find(target: Target) -> Intent {
         Intent {
             target,
+            color: None,
             region: None,
             order: OrderKey::ConfidenceDesc,
             limit: None,
@@ -217,6 +220,33 @@ impl Intent {
     }
 
     pub fn check(&self) -> Result<()> {
+        let entry = catalog::entry(self.target);
+        match (entry.finder, self.color) {
+            (Finder::Color { .. }, None) => {
+                return Err(SyrupError::new(
+                    Stage::Resolve,
+                    ErrorKind::Ambiguous,
+                    format!("{} of which colour?", entry.plural[0]),
+                )
+                .with_hint(format!(
+                    "e.g. red_{}; colours: {}",
+                    entry.plural[0],
+                    color_names()
+                )));
+            }
+            (Finder::Detect(_), Some(color)) => {
+                return Err(SyrupError::new(
+                    Stage::Resolve,
+                    ErrorKind::Unsupported,
+                    format!(
+                        "{} {} cannot be told apart by colour",
+                        color.name(),
+                        entry.plural[0]
+                    ),
+                ));
+            }
+            _ => {}
+        }
         let conflict = |reason: String| {
             Err(SyrupError::new(
                 Stage::Resolve,
@@ -247,7 +277,11 @@ impl Intent {
 
 impl fmt::Display for Intent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "find {}", catalog::entry(self.target).label)?;
+        f.write_str("find ")?;
+        if let Some(color) = self.color {
+            write!(f, "{} ", color.name())?;
+        }
+        f.write_str(catalog::entry(self.target).label)?;
         if let Some(region) = &self.region {
             write!(f, " in {region}")?;
         }
@@ -451,6 +485,19 @@ const UNSUPPORTED_QUALIFIERS: &[&str] = &[
     "cartoon",
 ];
 
+// Colour words without a hue range.
+const NON_HUES: &[&str] = &[
+    "white", "black", "grey", "gray", "brown", "pink", "gold", "silver", "beige", "dark", "light",
+];
+
+fn color_names() -> String {
+    catalog::COLORS
+        .iter()
+        .map(|c| c.names[0])
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 const NUMBER_WORDS: &[&str] = &[
     "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
 ];
@@ -464,6 +511,21 @@ pub fn region_named(name: &str) -> Option<RegionSpec> {
         .iter()
         .find(|(names, _)| names.contains(&name))
         .map(|(_, rect)| RegionSpec::Fixed { rect: rect() })
+}
+
+/// Whether the grammar already gives `word` a meaning, so a target added at
+/// run time may not use it in its noun.
+pub fn is_reserved(word: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "all", "in", "by", "than", "to", "pct", "percent", "larger", "bigger", "smaller",
+    ];
+    FIND_VERBS.contains(&word)
+        || OTHER_VERBS.iter().any(|(verb, _)| *verb == word)
+        || SELECTORS.iter().any(|(words, _)| words.contains(&word))
+        || KEYWORDS.contains(&word)
+        || NUMBER_WORDS.contains(&word)
+        || catalog::color_named(word).is_some()
+        || word.bytes().all(|b| b.is_ascii_digit())
 }
 
 pub fn grammar_summary() -> String {
@@ -513,7 +575,7 @@ impl<'a> Parser<'a> {
     /// Longest target phrase starting at `pos`, with whether it was plural.
     fn target_at(&self, pos: usize) -> Option<(usize, Target, bool)> {
         let mut best: Option<(usize, Target, bool)> = None;
-        for entry in catalog::TARGETS {
+        for entry in catalog::all() {
             for (phrases, plural) in [(entry.singular, false), (entry.plural, true)] {
                 for phrase in phrases {
                     let words: Vec<&str> = phrase.split('_').collect();
@@ -651,6 +713,7 @@ pub fn parse(name: &str) -> Result<Intent> {
     let mut count = None;
     let mut selector: Option<(OrderKey, &str)> = None;
     let mut all = false;
+    let mut color = None;
     let (target, plural) = loop {
         if let Some((len, target, plural)) = p.target_at(p.pos) {
             p.pos += len;
@@ -677,6 +740,21 @@ pub fn parse(name: &str) -> Result<Intent> {
             continue;
         }
         let word = p.peek();
+        if let Some(c) = catalog::color_named(word) {
+            p.pos += 1;
+            if color.replace(c).is_some() {
+                return Err(p.error(ErrorKind::Conflicting, "more than one colour"));
+            }
+            continue;
+        }
+        if NON_HUES.contains(&word) {
+            return Err(p
+                .error(
+                    ErrorKind::Unsupported,
+                    format!("{word} has no hue Syrup can match"),
+                )
+                .with_hint(format!("colours: {}", color_names())));
+        }
         if let Some(e) = p.ambiguous(word) {
             return Err(e);
         }
@@ -703,6 +781,7 @@ pub fn parse(name: &str) -> Result<Intent> {
     };
 
     let mut intent = Intent::find(target);
+    intent.color = color;
     let mut order_clause: Option<&str> = None;
     while p.pos < p.tokens.len() {
         if p.eat(&["in"]) {
@@ -851,6 +930,12 @@ mod tests {
         assert_eq!(ok("find_most_confident_face").limit, Some(1));
         assert_eq!(ok("find_three_leftmost_faces").limit, Some(3));
         assert_eq!(ok("find_faces_in_region").region, Some(RegionSpec::Caller));
+        let bars = ok("find_2_largest_red_bars_in_bottom_third");
+        assert_eq!(
+            (bars.target, bars.color, bars.limit),
+            (Target::Bar, Some(Color::Red), Some(2))
+        );
+        assert_eq!(ok("find_violet_blobs"), ok("find_purple_regions"));
         assert_eq!(
             ok("find_faces_smaller_than_10_percent").max_area_pct,
             Some(10)
@@ -876,6 +961,10 @@ mod tests {
             ("find_cars", ErrorKind::Unsupported),
             ("find_people", ErrorKind::Unsupported),
             ("count_faces", ErrorKind::Unsupported),
+            ("find_regions", ErrorKind::Ambiguous),
+            ("find_white_regions", ErrorKind::Unsupported),
+            ("find_red_faces", ErrorKind::Unsupported),
+            ("find_red_blue_regions", ErrorKind::Conflicting),
             (
                 "find_faces_in_top_half_in_left_half",
                 ErrorKind::Conflicting,

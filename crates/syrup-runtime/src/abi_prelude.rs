@@ -1,11 +1,12 @@
-// Syrup operation ABI v1. Included by the host and pasted verbatim into every
-// generated module, so both sides always agree. Bump SYRUP_ABI_VERSION on any
-// change.
+// Syrup operation ABI v2. Included by the host and pasted verbatim into every
+// generated module, so both sides always agree. Bump SYRUP_ABI_VERSION when a
+// type's layout or a function's meaning changes; new capability ids are not
+// breaking, since hosts refuse ids they do not know.
 //
 // Views are borrowed for one call. Detections returned by `detect` belong to
 // the host and stay valid only until the module's next call into the host.
 
-pub const SYRUP_ABI_VERSION: u32 = 1;
+pub const SYRUP_ABI_VERSION: u32 = 2;
 
 pub const SYRUP_OK: i32 = 0;
 pub const SYRUP_ERR_PROVIDER: i32 = 1;
@@ -15,6 +16,7 @@ pub const SYRUP_ERR_PANIC: i32 = 4;
 pub const SYRUP_ERR_EMIT: i32 = 5;
 
 pub const SYRUP_CAP_FACE: u32 = 1;
+pub const SYRUP_CAP_TEXT: u32 = 2;
 
 pub const SYRUP_MAX_KEYPOINTS: usize = 5;
 
@@ -64,6 +66,36 @@ pub type SyrupDetectFn = unsafe extern "C" fn(
     out_len: *mut usize,
 ) -> i32;
 
+/// A horizontal run of pixels on row `y`, from `x0` to `x1` inclusive.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SyrupRun {
+    pub y: u32,
+    pub x0: u32,
+    pub x1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SyrupRect {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
+/// Merge runs (in row order) into rectangles with the core's region
+/// grouping. Rectangles are valid until the module's next host call.
+pub type SyrupGroupFn = unsafe extern "C" fn(
+    ctx: *mut core::ffi::c_void,
+    runs: *const SyrupRun,
+    n_runs: usize,
+    min_height: u32,
+    max_gap: u32,
+    out_ptr: *mut *const SyrupRect,
+    out_len: *mut usize,
+) -> i32;
+
 pub type SyrupEmitFn =
     unsafe extern "C" fn(ctx: *mut core::ffi::c_void, detection: *const SyrupDetection) -> i32;
 
@@ -74,6 +106,7 @@ pub struct SyrupHost {
     pub ctx: *mut core::ffi::c_void,
     pub detect: SyrupDetectFn,
     pub emit: SyrupEmitFn,
+    pub group: SyrupGroupFn,
 }
 
 pub type SyrupRunFn = unsafe extern "C" fn(

@@ -22,6 +22,8 @@ class Found:
     # The provider's score in [0, 1]; not a calibrated probability.
     confidence: float
     keypoints: dict[str, tuple[float, float]] = field(default_factory=dict)
+    # What a word says, for targets that read text.
+    text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -65,6 +67,7 @@ def from_json(text):
             Box(**f["box"]),
             f["confidence"],
             {k["name"]: (k["x"], k["y"]) for k in f["keypoints"]},
+            f["text"],
         )
         for f in data["items"]
     ]

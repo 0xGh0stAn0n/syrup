@@ -9,6 +9,7 @@ What every `find_*` operation honours, whichever name or language reached it.
 | `from syrup.ops import find_face` / `syrup.ops.find_face` (PEP 562 module `__getattr__`) | on import or attribute access | on first call, or `op.prepare()` |
 | `syrup.resolve("find_face")` | on the call | on first call, or `op.prepare()` |
 | `syrup.define("find_header_faces", ...)`, for names outside the grammar | on the call | on first call, or `op.prepare()` |
+| `syrup.add_target("qr_code", detect)` adds a noun found by a Python function; names then use it like any other | on later resolves | on first call |
 | Rust: `Runtime::resolve` / `Runtime::define` | on the call | on first `run`, or `prepare()` |
 
 Resolution never compiles, so a name Syrup cannot honour fails at import,
@@ -18,9 +19,11 @@ an ordinary `NameError`; Python has no honest hook for that.
 ## 2. Grammar (v1)
 
 ```text
-name      := verb "_" [count "_" selector "_" | selector "_" | "all_"] target ("_" clause)*
+name      := verb "_" [count "_" selector "_" | selector "_" | "all_"] [colour "_"] target ("_" clause)*
 verb      := find | detect | locate
-target    := face | faces | human_face | human_faces
+target    := face | faces | human_face | human_faces | word | words
+           | region | regions | blob | blobs | bar | bars
+colour    := red | orange | yellow | green | cyan | blue | purple | violet | magenta
 selector  := largest | biggest | smallest | leftmost | rightmost | topmost | bottommost | most_confident
 count     := 1..100, or one..ten
 clause    := in_<region> | by_size | by_area | by_confidence | by_score
@@ -30,6 +33,30 @@ region    := top_half | bottom_half | left_half | right_half
            | top_left | top_right | bottom_left | bottom_right
            | top_third | bottom_third | left_third | right_third | center | region
 ```
+
+Faces come from YuNet, words from Tesseract, and nouns added with
+`add_target` from their own detector, which receives the searched pixels
+and returns `(x, y, w, h, score[, text])` boxes in them; the compiled
+module does the rest. Added nouns may not use words the grammar already
+gives a meaning (verbs, selectors, colours, `in`, `by`, numbers, ...) or
+existing nouns, so adding one never changes what an existing name means. Regions and bars need a
+colour and are found by the generated module itself: pixels whose hue falls
+in the colour's range (saturation ≥ 35%, value ≥ 30%, alpha ≥ 50%), in
+horizontal runs of at least 3 pixels, grouped by the core's region grouping
+into regions at least 3 rows tall. Bars use runs of 8 and gaps of up to 2
+rows, like the core's bar finder, and must be at least 3 times wider than
+tall.
+
+| colour | hue (degrees) |
+|---|---|
+| red | 340–20 |
+| orange | 20–45 |
+| yellow | 45–70 |
+| green | 70–165 |
+| cyan | 165–195 |
+| blue | 195–255 |
+| purple, violet | 255–290 |
+| magenta | 290–340 |
 
 Singular and plural mean the same: `find_face` returns every face, so
 `faces = find_face(img)` reads right. One result is spelled with a selector:
@@ -62,6 +89,9 @@ to one item.
 - `keypoints`: named points, same coordinates, clipped. Faces carry
   `right_eye`, `left_eye`, `nose_tip`, `right_mouth_corner`,
   `left_mouth_corner` (the subject's right and left).
+- `text`: what a word says; empty for targets that do not read text. A
+  word's confidence is Tesseract's, divided by 100. A region's or bar's is
+  the share of its box's pixels that have the colour.
 
 Default order is confidence, highest first. Every order ends with the same
 tie-breakers (confidence ↓, then y, x, h, w ↑), so it is total.
@@ -84,7 +114,7 @@ Per-call parameters never trigger a rebuild:
 
 | | default | |
 |---|---|---|
-| `min_confidence` | faces 0.6 | in `[0, 1]`; the face provider never reports below 0.1 |
+| `min_confidence` | faces 0.6, words 0.5, regions and bars 0 | in `[0, 1]`; the face provider never reports below 0.1 |
 | `max_results` | none | ≥ 1, applied after the operation's own limit |
 | `region` | | required by `_in_region` operations, refused by all others |
 
@@ -129,6 +159,8 @@ Refused rather than guessed:
 | `find_highest_face` | ambiguous | by position or by confidence? |
 | `find_two_faces`, `find_largest_faces` | ambiguous | a count needs an ordering; a plural selector needs a count |
 | `find_smiling_faces`, `find_cat_faces` | unsupported | no capability judges that |
+| `find_regions` | ambiguous | regions of which colour? |
+| `find_white_regions`, `find_red_faces` | unsupported | white has no hue; faces are not found by colour |
 | `find_cars`, `find_people` | unsupported | no capability finds that |
 | `find_faces_in_top_half_in_left_half` | conflicting | one region per operation |
 | any unknown word | malformed or unsupported | unknown words are never dropped |

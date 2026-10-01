@@ -55,6 +55,7 @@ enum Helper {
     SelectFixed,
     SelectCaller,
     Detect,
+    Color,
     Restore,
     TieBreak,
     Emit,
@@ -70,6 +71,23 @@ struct Window {
     view: SyrupImageView,
     x: u32,
     y: u32,
+    // The whole input image, so pixel reads can be bounds-checked.
+    base: *const u8,
+    len: usize,
+}
+
+fn input_window(input: &SyrupImageView) -> Window {
+    let len = match input.height {
+        0 => 0,
+        h => (h as usize - 1) * input.stride + input.width as usize * input.channels as usize,
+    };
+    Window {
+        view: *input,
+        x: 0,
+        y: 0,
+        base: input.data,
+        len,
+    }
 }
 
 fn sub_window(parent: &Window, x: u32, y: u32, w: u32, h: u32) -> Window {
@@ -84,6 +102,8 @@ fn sub_window(parent: &Window, x: u32, y: u32, w: u32, h: u32) -> Window {
         },
         x: parent.x + x,
         y: parent.y + y,
+        base: parent.base,
+        len: parent.len,
     }
 }
 "#
@@ -140,6 +160,132 @@ fn detect(host: &SyrupHost, capability: u32, window: &Window) -> Result<Vec<Syru
     }
     // SAFETY: the host keeps `len` detections at `ptr` until our next call into it.
     Ok(unsafe { core::slice::from_raw_parts(ptr, len) }.to_vec())
+}
+"#
+            }
+            Helper::Color => {
+                r#"
+// The same arithmetic as syrup::color::hsv_from_rgb.
+fn hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+    let rf = r as f32 / 255.0;
+    let gf = g as f32 / 255.0;
+    let bf = b as f32 / 255.0;
+    let max = rf.max(gf).max(bf);
+    let min = rf.min(gf).min(bf);
+    let delta = max - min;
+    let h = if delta == 0.0 {
+        0.0
+    } else if max == rf {
+        60.0 * ((gf - bf) / delta % 6.0)
+    } else if max == gf {
+        60.0 * ((bf - rf) / delta + 2.0)
+    } else {
+        60.0 * ((rf - gf) / delta + 4.0)
+    };
+    let h = if h < 0.0 { h + 360.0 } else { h };
+    let s = if max == 0.0 { 0.0 } else { delta / max };
+    (h, s.clamp(0.0, 1.0), max.clamp(0.0, 1.0))
+}
+
+fn row(window: &Window, y: u32) -> Result<&[u8], i32> {
+    let v = &window.view;
+    let start = (v.data as usize).wrapping_sub(window.base as usize) + y as usize * v.stride;
+    let len = v.width as usize * v.channels as usize;
+    if start.checked_add(len).is_none_or(|end| end > window.len) {
+        return Err(SYRUP_ERR_INPUT);
+    }
+    // SAFETY: the row lies inside the input image, which outlives the call.
+    Ok(unsafe { core::slice::from_raw_parts(window.base.add(start), len) })
+}
+
+fn group(host: &SyrupHost, runs: &[SyrupRun], min_height: u32, max_gap: u32) -> Result<Vec<SyrupRect>, i32> {
+    let mut ptr: *const SyrupRect = core::ptr::null();
+    let mut len = 0usize;
+    // SAFETY: the host reads `runs` during the call and owns what it returns.
+    let status = unsafe {
+        (host.group)(host.ctx, runs.as_ptr(), runs.len(), min_height, max_gap, &mut ptr, &mut len)
+    };
+    if status != SYRUP_OK {
+        return Err(status);
+    }
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if ptr.is_null() {
+        return Err(SYRUP_ERR_PROVIDER);
+    }
+    // SAFETY: valid until our next call into the host.
+    Ok(unsafe { core::slice::from_raw_parts(ptr, len) }.to_vec())
+}
+
+fn find_color(
+    host: &SyrupHost,
+    window: &Window,
+    matches: fn(u8, u8, u8, u8) -> bool,
+    min_run: u32,
+    min_height: u32,
+    max_gap: u32,
+) -> Result<Vec<SyrupDetection>, i32> {
+    let (width, height) = (window.view.width, window.view.height);
+    if width == 0 || height == 0 {
+        return Ok(Vec::new());
+    }
+    let channels = window.view.channels as usize;
+    let pixel = |p: &[u8]| match channels {
+        1 => matches(p[0], p[0], p[0], 255),
+        3 => matches(p[0], p[1], p[2], 255),
+        _ => matches(p[0], p[1], p[2], p[3]),
+    };
+    let mut runs = Vec::new();
+    for y in 0..height {
+        let mut start = None;
+        for (x, p) in row(window, y)?.chunks_exact(channels).enumerate() {
+            let x = x as u32;
+            match (pixel(p), start) {
+                (true, None) => start = Some(x),
+                (false, Some(s)) => {
+                    if x - s >= min_run {
+                        runs.push(SyrupRun { y, x0: s, x1: x - 1 });
+                    }
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(s) = start {
+            if width - s >= min_run {
+                runs.push(SyrupRun { y, x0: s, x1: width - 1 });
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for r in group(host, &runs, min_height, max_gap)? {
+        let inside = r.w > 0
+            && r.h > 0
+            && r.x.checked_add(r.w).is_some_and(|e| e <= width)
+            && r.y.checked_add(r.h).is_some_and(|e| e <= height);
+        if !inside {
+            return Err(SYRUP_ERR_PROVIDER);
+        }
+        let mut hits = 0u32;
+        for y in r.y..r.y + r.h {
+            let line = &row(window, y)?[r.x as usize * channels..(r.x + r.w) as usize * channels];
+            for p in line.chunks_exact(channels) {
+                hits += pixel(p) as u32;
+            }
+        }
+        out.push(SyrupDetection {
+            x: r.x as f32,
+            y: r.y as f32,
+            w: r.w as f32,
+            h: r.h as f32,
+            score: hits as f32 / (r.w * r.h) as f32,
+            n_keypoints: 0,
+            keypoints: [0.0; 2 * SYRUP_MAX_KEYPOINTS],
+            payload: 0,
+        });
+    }
+    Ok(out)
 }
 "#
             }
@@ -227,6 +373,7 @@ fn primary_order(key: OrderKey) -> Option<&'static str> {
 /// The module's source. The plan must have passed `Plan::check`.
 pub fn generate(plan: &Plan, intent: &Intent, plan_hash: &str) -> String {
     let mut helpers = BTreeSet::new();
+    let mut predicates = String::new();
     let mut body = String::new();
     let b = &mut body;
     if plan
@@ -243,7 +390,7 @@ pub fn generate(plan: &Plan, intent: &Intent, plan_hash: &str) -> String {
         match *step {
             Step::Input => {
                 helpers.insert(Helper::Window);
-                let _ = writeln!(b, "    let v{i} = Window {{ view: *input, x: 0, y: 0 }};");
+                let _ = writeln!(b, "    let v{i} = input_window(input);");
             }
             Step::SelectRegion {
                 view,
@@ -273,6 +420,41 @@ pub fn generate(plan: &Plan, intent: &Intent, plan_hash: &str) -> String {
                     "    let v{i} = detect(host, {}, &v{view})?;",
                     capability.abi_id()
                 );
+            }
+            Step::FindColor {
+                view,
+                hue,
+                min_saturation_pct,
+                min_value_pct,
+                min_run,
+                min_height,
+                max_gap,
+            } => {
+                helpers.insert(Helper::Color);
+                let (lo, hi) = (hue.0 as f32, hue.1 as f32);
+                let hue_test = if lo <= hi {
+                    format!("h >= {lo:?} && h <= {hi:?}")
+                } else {
+                    format!("(h >= {lo:?} || h <= {hi:?})")
+                };
+                let (sat, val) = (
+                    min_saturation_pct as f32 / 100.0,
+                    min_value_pct as f32 / 100.0,
+                );
+                let _ = write!(
+                    predicates,
+                    "\nfn matches_v{i}(r: u8, g: u8, b: u8, a: u8) -> bool {{\n    \
+                     let (h, s, v) = hsv(r, g, b);\n    \
+                     a as f32 / 255.0 >= 0.5 && {hue_test} && s >= {sat:?} && v >= {val:?}\n}}\n"
+                );
+                let _ = writeln!(
+                    b,
+                    "    let v{i} = find_color(host, &v{view}, matches_v{i}, {min_run}, {min_height}, {max_gap})?;"
+                );
+            }
+            Step::FilterAspect { boxes, min } => {
+                let _ = writeln!(b, "    let mut v{i} = v{boxes};");
+                let _ = writeln!(b, "    v{i}.retain(|d| d.w >= {min}_f32 * d.h);");
             }
             Step::Restore { boxes, view } => {
                 helpers.insert(Helper::Restore);
@@ -356,6 +538,7 @@ pub fn generate(plan: &Plan, intent: &Intent, plan_hash: &str) -> String {
     for helper in helpers {
         src.push_str(helper.source());
     }
+    src.push_str(&predicates);
     src
 }
 
@@ -419,6 +602,7 @@ mod tests {
     #[test]
     fn generated_sources_pass_the_policy() {
         for name in [
+            "find_red_bars_in_bottom_third",
             "find_face",
             "find_2_largest_faces_in_top_half_larger_than_2pct",
             "find_faces_in_region_left_to_right",

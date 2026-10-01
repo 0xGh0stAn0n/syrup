@@ -29,6 +29,13 @@ cached, and loaded. Later calls and later processes reuse the compiled
 module. Names Syrup cannot honour fail at import with a reason:
 `find_best_face` is refused because "best" does not say by what.
 
+Detectors from any Python library become nouns the same way:
+
+```python
+syrup.add_target("qr_code", my_qr_detector)   # e.g. OpenCV, a YOLO model, ...
+codes = syrup.ops.find_qr_codes_in_bottom_half_left_to_right("page.png")
+```
+
 The same mechanism is available from Rust (`syrup_runtime::Runtime`) and
 from the command line:
 
@@ -53,8 +60,10 @@ the design.
   gives moving regions stable IDs, velocity, and occlusion grace.
 - **OCR** — text recognition of small on-screen UI text via a Tesseract
   subprocess, with automatic crop upscaling (small pixel fonts are
-  otherwise unreadable to it); on Windows, the OS's built-in OCR engine is
-  also exposed, which is trained on screen content.
+  otherwise unreadable to it). `ocr::recognize` returns words in image
+  coordinates and says why it failed; the older `ocr_region` is kept for
+  existing callers. On Windows, the OS's built-in OCR engine is also
+  exposed, which is trained on screen content.
 - **Quality** — a sharpness metric that predicts whether OCR on a region
   can succeed at all, so blurred input is reported as *blurred* rather than
   silently producing wrong text.
@@ -141,9 +150,9 @@ on a domain edition, so this repository stands alone.
 - Tesseract must be installed separately for OCR (`TESSERACT_BIN` or
   `PATH`); without it, OCR reports itself unavailable rather than failing.
 - Live capture is Windows-only. Other platforms consume file-based frames.
-- Operations by name currently cover face detection, and compiling a new
-  operation needs `rustc` where it first runs (or a cache prepared
-  elsewhere, with `SYRUP_MODE=frozen`).
+- Operations by name currently cover faces, printed words, and colour
+  regions and bars. Compiling a new operation needs `rustc` where it first
+  runs (or a cache prepared elsewhere, with `SYRUP_MODE=frozen`).
 
 ## Syrup and MapleSyrup
 

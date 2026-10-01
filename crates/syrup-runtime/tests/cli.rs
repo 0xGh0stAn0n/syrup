@@ -8,7 +8,12 @@ use serde_json::Value;
 fn syrup(cache: &TempDir, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_syrup"));
     command.args(args).env("SYRUP_CACHE_DIR", &cache.0);
-    for var in ["SYRUP_MODE", "SYRUP_RUSTC", "SYRUP_FACE_MODEL"] {
+    for var in [
+        "SYRUP_MODE",
+        "SYRUP_RUSTC",
+        "SYRUP_FACE_MODEL",
+        "TESSERACT_BIN",
+    ] {
         command.env_remove(var);
     }
     command.envs(env.iter().copied()).output().unwrap()
@@ -88,4 +93,27 @@ fn failures_exit_non_zero_with_the_stage() {
         &[],
     ));
     assert_eq!(empty["items"], Value::Array(vec![]));
+}
+
+#[test]
+fn a_missing_ocr_engine_is_a_dependency_error() {
+    let cache = TempDir::new();
+    // Compile first, so the engine is the only thing missing at run time.
+    assert!(
+        syrup(&cache, &["prepare", "find_words"], &[])
+            .status
+            .success()
+    );
+    let page = fixture_path("words.png");
+    let out = syrup(
+        &cache,
+        &["run", "find_words", page.to_str().unwrap()],
+        &[("PATH", ""), ("TESSERACT_BIN", "/nonexistent/tesseract")],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("[execute/missing_dependency]"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

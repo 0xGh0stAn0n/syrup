@@ -25,6 +25,7 @@ pub mod catalog;
 mod codegen;
 mod compiler;
 pub mod contract;
+pub mod custom;
 pub mod error;
 mod host;
 pub mod intent;

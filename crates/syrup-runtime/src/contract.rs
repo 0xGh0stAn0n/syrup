@@ -204,6 +204,8 @@ pub struct Found {
     /// Provider score in [0, 1], not a calibrated probability.
     pub confidence: f32,
     pub keypoints: Vec<Keypoint>,
+    /// What a word says, for targets that read text.
+    pub text: Option<String>,
 }
 
 /// How a run got its compiled module.
