@@ -64,7 +64,10 @@ from syrup.ops import find_face        Runtime::resolve("find_face")
    compiles on first call. A bare name that was never imported cannot be
    intercepted honestly, so it is not attempted. Names outside the grammar
    go through `syrup.define`.
-6. **The model is a pinned dependency of the runtime.** YuNet 2023mar (MIT,
+6. **New detectors plug in without Rust.** `syrup.add_target(noun, detect)`
+   registers a Python function (any ML library) as a provider; names using
+   the noun compile to modules that call it through the same ABI.
+7. **The model is a pinned dependency of the runtime.** YuNet 2023mar (MIT,
    232 KB, SHA-256 checked) runs through `tract-onnx`: pure Rust, no OpenCV.
    The core crate stays model-free.
 

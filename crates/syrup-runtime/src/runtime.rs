@@ -587,7 +587,8 @@ impl Operation {
                     .plan
                     .capabilities()
                     .into_iter()
-                    .map(|c| self.runtime.0.providers.get(c).info())
+                    .filter_map(|c| self.runtime.0.providers.get(c).ok())
+                    .map(|p| p.info())
                     .collect(),
                 params: EffectiveParams {
                     min_confidence,

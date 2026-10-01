@@ -1,31 +1,49 @@
-//! Targets Syrup can find and how each one is found. Adding a target is a
-//! new entry here; the grammar, planner and generator are shared.
+//! Targets Syrup can find and how each one is found. Built-in targets are
+//! entries here; targets added at run time live in [`crate::custom`]. The
+//! grammar, planner and generator are shared by both.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::abi;
+use crate::custom;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+/// The noun of a target added at run time. Interned, so it stays `Copy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct Name(pub(crate) &'static str);
+
+impl Name {
+    pub fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Target {
     Face,
     Word,
     Region,
     Bar,
+    Custom(Name),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
     FaceDetection,
     TextRecognition,
+    Custom(Name),
 }
 
 impl Capability {
+    /// Run-time capabilities get an id derived from their name, so a module
+    /// compiled in one process calls the same detector in another.
     pub fn abi_id(self) -> u32 {
         match self {
             Capability::FaceDetection => abi::SYRUP_CAP_FACE,
             Capability::TextRecognition => abi::SYRUP_CAP_TEXT,
+            Capability::Custom(name) => custom_id(name.as_str()),
         }
     }
 
@@ -33,7 +51,10 @@ impl Capability {
         match id {
             abi::SYRUP_CAP_FACE => Some(Capability::FaceDetection),
             abi::SYRUP_CAP_TEXT => Some(Capability::TextRecognition),
-            _ => None,
+            id => custom::entries().into_iter().find_map(|e| match e.finder {
+                Finder::Detect(c @ Capability::Custom(_)) if c.abi_id() == id => Some(c),
+                _ => None,
+            }),
         }
     }
 
@@ -41,11 +62,20 @@ impl Capability {
         match self {
             Capability::FaceDetection => "face_detection",
             Capability::TextRecognition => "text_recognition",
+            Capability::Custom(name) => name.as_str(),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+/// FNV-1a with the top bit set, clear of the built-in ids.
+pub(crate) fn custom_id(name: &str) -> u32 {
+    let hash = name.bytes().fold(0x811c_9dc5u32, |h, b| {
+        (h ^ b as u32).wrapping_mul(0x0100_0193)
+    });
+    hash | 0x8000_0000
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Color {
     Red,
@@ -220,17 +250,22 @@ pub const TARGETS: &[TargetEntry] = &[
     },
 ];
 
+/// Built-in targets, then those added at run time.
+pub fn all() -> Vec<&'static TargetEntry> {
+    TARGETS.iter().chain(custom::entries()).collect()
+}
+
 pub fn entry(target: Target) -> &'static TargetEntry {
-    TARGETS
-        .iter()
+    all()
+        .into_iter()
         .find(|e| e.target == target)
-        .expect("every target is in the catalog")
+        .expect("targets are only made by the catalog")
 }
 
 /// A target by any of its nouns, e.g. `face` or `human_faces`.
 pub fn target_named(noun: &str) -> Option<Target> {
-    TARGETS
-        .iter()
+    all()
+        .into_iter()
         .find(|e| e.singular.contains(&noun) || e.plural.contains(&noun))
         .map(|e| e.target)
 }
@@ -243,8 +278,8 @@ pub fn color_named(word: &str) -> Option<Color> {
 }
 
 pub fn known_targets() -> String {
-    TARGETS
-        .iter()
+    all()
+        .into_iter()
         .map(|e| format!("{} ({})", e.plural[0], e.description))
         .collect::<Vec<_>>()
         .join("; ")

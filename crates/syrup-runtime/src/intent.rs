@@ -5,14 +5,14 @@
 
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::catalog::{self, Color, Finder, Target};
 use crate::error::{ErrorKind, Result, Stage, SyrupError};
 
 /// An exact fraction. Regions use these so the interpreter and generated
 /// code compute identical pixel bounds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct Ratio {
     pub num: u32,
     pub den: u32,
@@ -65,7 +65,7 @@ fn gcd(a: u64, b: u64) -> u64 {
 }
 
 /// Half-open pixel rectangle `[x, x+w) × [y, y+h)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct PixelRect {
     pub x: u32,
     pub y: u32,
@@ -74,7 +74,7 @@ pub struct PixelRect {
 }
 
 /// A rectangle as fractions of the image size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct NormRect {
     pub x: Ratio,
     pub y: Ratio,
@@ -132,7 +132,7 @@ impl fmt::Display for NormRect {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RegionSpec {
     Fixed {
@@ -151,7 +151,7 @@ impl fmt::Display for RegionSpec {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrderKey {
     ConfidenceDesc,
@@ -193,7 +193,7 @@ impl OrderKey {
 
 /// What an operation means. Names that resolve to the same intent are the
 /// same operation and share one compiled artifact.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct Intent {
     pub target: Target,
     /// Required by targets found by colour, refused by the others.
@@ -513,6 +513,21 @@ pub fn region_named(name: &str) -> Option<RegionSpec> {
         .map(|(_, rect)| RegionSpec::Fixed { rect: rect() })
 }
 
+/// Whether the grammar already gives `word` a meaning, so a target added at
+/// run time may not use it in its noun.
+pub fn is_reserved(word: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "all", "in", "by", "than", "to", "pct", "percent", "larger", "bigger", "smaller",
+    ];
+    FIND_VERBS.contains(&word)
+        || OTHER_VERBS.iter().any(|(verb, _)| *verb == word)
+        || SELECTORS.iter().any(|(words, _)| words.contains(&word))
+        || KEYWORDS.contains(&word)
+        || NUMBER_WORDS.contains(&word)
+        || catalog::color_named(word).is_some()
+        || word.bytes().all(|b| b.is_ascii_digit())
+}
+
 pub fn grammar_summary() -> String {
     let regions: Vec<&str> = NAMED_REGIONS.iter().map(|(names, _)| names[0]).collect();
     format!(
@@ -560,7 +575,7 @@ impl<'a> Parser<'a> {
     /// Longest target phrase starting at `pos`, with whether it was plural.
     fn target_at(&self, pos: usize) -> Option<(usize, Target, bool)> {
         let mut best: Option<(usize, Target, bool)> = None;
-        for entry in catalog::TARGETS {
+        for entry in catalog::all() {
             for (phrases, plural) in [(entry.singular, false), (entry.plural, true)] {
                 for phrase in phrases {
                     let words: Vec<&str> = phrase.split('_').collect();
