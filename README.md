@@ -10,6 +10,38 @@ certainty than the pixels support. Every detector result carries a
 confidence score, a reliability grade, and a failure reason when nothing was
 found.
 
+## Operations by name
+
+Name the operation you want and Syrup builds it:
+
+```python
+from syrup.ops import find_largest_face_in_top_half
+
+faces = find_largest_face_in_top_half("photo.jpg")
+for face in faces:
+    print(face.box, face.confidence, face.keypoints["left_eye"])
+```
+
+Nobody wrote `find_largest_face_in_top_half`. The name is parsed into an
+intent, the intent into a typed plan, and the plan into a small Rust module
+that is compiled with `rustc`, checked against a reference interpreter,
+cached, and loaded. Later calls and later processes reuse the compiled
+module. Names Syrup cannot honour fail at import with a reason:
+`find_best_face` is refused because "best" does not say by what.
+
+The same mechanism is available from Rust (`syrup_runtime::Runtime`) and
+from the command line:
+
+```sh
+syrup explain find_2_largest_faces_in_center   # what the name means
+syrup source find_face                         # the generated module
+syrup run find_faces photo.jpg --draw out.png  # JSON results
+```
+
+[docs/contract.md](docs/contract.md) has the grammar, the result contract
+and every way an operation can fail; [docs/architecture.md](docs/architecture.md)
+the design.
+
 ## What it does
 
 - **Geometry** — rectangle segmentation and grouping over pixel predicates,
@@ -35,8 +67,10 @@ found.
 
 - No input synthesis, no window manipulation, no process inspection: the
   library **reads pixels and reports observations**, nothing else.
-- No trained models and no model files: every primitive is deterministic
-  and explainable, which keeps results reproducible in tests.
+- No trained models in the core: every primitive is deterministic and
+  explainable, which keeps results reproducible in tests. Learned
+  capabilities (YuNet face detection, pinned by SHA-256) live in
+  `syrup-runtime`.
 - No opinion about what an observation *means* — semantics belong to the
   application built on top.
 
@@ -86,15 +120,19 @@ value without saying *how sure* it is.
 ## Testing
 
 ```sh
-cargo test          # unit + synthetic-screen integration tests
-cargo clippy --all-targets -- -D warnings
-cargo bench         # criterion benchmarks for the per-frame primitives
+cargo test --workspace   # core, runtime, and end-to-end face detection
+cargo clippy --workspace --all-targets -- -D warnings
+cargo bench              # criterion benchmarks for the per-frame primitives
+
+cd python && maturin develop --release && pytest tests
 ```
 
-All tests run against synthetic, in-code fixtures; no external tools,
-assets, or network access are required. OCR tests cover argument
-construction and temp-file hygiene without invoking Tesseract. Nothing in
-the suite depends on a domain edition, so this repository stands alone.
+The core's tests run against synthetic, in-code fixtures. The runtime's
+compile real modules, so they need `rustc` on the PATH, and detect faces in
+three public-domain and CC0 photographs in `crates/syrup-runtime/tests/fixtures`.
+No network access is needed. OCR tests cover argument construction and
+temp-file hygiene without invoking Tesseract. Nothing in the suite depends
+on a domain edition, so this repository stands alone.
 
 ## Limitations
 
@@ -103,6 +141,9 @@ the suite depends on a domain edition, so this repository stands alone.
 - Tesseract must be installed separately for OCR (`TESSERACT_BIN` or
   `PATH`); without it, OCR reports itself unavailable rather than failing.
 - Live capture is Windows-only. Other platforms consume file-based frames.
+- Operations by name currently cover face detection, and compiling a new
+  operation needs `rustc` where it first runs (or a cache prepared
+  elsewhere, with `SYRUP_MODE=frozen`).
 
 ## Syrup and MapleSyrup
 
