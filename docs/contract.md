@@ -178,6 +178,12 @@ change, and the library's SHA-256 is checked before every load. Damaged
 artifacts are moved aside and rebuilt in development mode, and refused in
 frozen mode (`SYRUP_MODE=frozen`), which never generates or compiles.
 
+A bundle (`syrup bundle <dir> <operation>...`, `syrup.bundle`) is a cache
+directory holding only the named operations, plus `bundle.json` recording
+the target, ABI and code generator. Frozen mode pointed at a bundle loads
+from it; an operation missing from it, or a bundle for another target or
+Syrup version, is `not_prepared` with that reason.
+
 An artifact is published only after:
 
 1. the plan type-checks, with results in input-image coordinates;

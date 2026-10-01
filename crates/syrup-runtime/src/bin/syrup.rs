@@ -8,6 +8,7 @@ const USAGE: &str = "usage:
   syrup explain <operation>
   syrup source <operation>
   syrup prepare <operation>...
+  syrup bundle <dir> <operation>...
   syrup run <operation> <image> [--min-confidence F] [--max-results N] [--region X,Y,W,H] [--draw OUT]
   syrup cache [path|list|clear]";
 
@@ -59,6 +60,19 @@ fn run(args: &[String]) -> Result<(), Failure> {
                     prepared.library.display()
                 );
             }
+        }
+        Some("bundle") => {
+            if args.len() < 3 {
+                return Err(usage("bundle needs a directory and at least one operation"));
+            }
+            let names: Vec<&str> = args[2..].iter().map(String::as_str).collect();
+            let index = runtime.bundle(Path::new(&args[1]), &names)?;
+            println!(
+                "{}: {} operations for {}",
+                args[1],
+                index.operations.len(),
+                index.target
+            );
         }
         Some("run") => {
             let op = runtime.resolve(arg(args, 1)?)?;

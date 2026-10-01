@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::abi::*;
-use crate::cache::{self, Manifest, Store};
+use crate::cache::{self, BundleIndex, Manifest, Store};
 use crate::catalog;
 use crate::codegen;
 use crate::compiler::{HOST_TARGET, Rustc};
@@ -189,6 +189,18 @@ impl Runtime {
         self.operation(name, intent)
     }
 
+    /// Prepares each operation and copies its artifact into the bundle at
+    /// `dest`, for machines that run with `SYRUP_MODE=frozen` and no compiler.
+    pub fn bundle(&self, dest: &Path, names: &[&str]) -> Result<BundleIndex> {
+        let mut operations = vec![];
+        for name in names {
+            let op = self.resolve(name)?;
+            op.prepare()?;
+            operations.push((name.to_string(), op.key));
+        }
+        self.0.store.export(dest, &operations)
+    }
+
     fn operation(&self, name: &str, intent: Intent) -> Result<Operation> {
         let plan = Plan::build(&intent).map_err(|e| e.for_operation(name))?;
         let plan_hash = plan.hash();
@@ -318,13 +330,22 @@ impl Operation {
                 (Loaded { module, manifest }, ArtifactStatus::LoadedFromDisk)
             }
             Ok(None) if frozen => {
-                return Err(SyrupError::new(
-                    Stage::Load,
-                    ErrorKind::NotPrepared,
-                    format!("no prepared artifact for {} and frozen mode never compiles", self.name),
-                )
-                .with_hint("run `syrup prepare` with the same cache directory where a compiler is available")
-                .with_detail("artifact", self.key.clone()));
+                let reason = match inner.store.bundle_index() {
+                    Some(index) => index.incompatibility().unwrap_or_else(|| {
+                        format!(
+                            "{} is not in the bundle at {}",
+                            self.name,
+                            inner.store.root().display()
+                        )
+                    }),
+                    None => format!(
+                        "no prepared artifact for {} and frozen mode never compiles",
+                        self.name
+                    ),
+                };
+                return Err(SyrupError::new(Stage::Load, ErrorKind::NotPrepared, reason)
+                    .with_hint("build it with `syrup bundle <dir> <operation>...` on a machine with rustc and the same platform")
+                    .with_detail("artifact", self.key.clone()));
             }
             Err(e) if e.kind == ErrorKind::Integrity && !frozen => {
                 inner.store.quarantine(&self.key)?;

@@ -45,6 +45,20 @@ syrup source find_face                         # the generated module
 syrup run find_faces photo.jpg --draw out.png  # JSON results
 ```
 
+Install with `pip install syrup-cv` (the import is `syrup`), or from a
+checkout with `pip install ./python`. Compiling an operation needs `rustc`
+1.82 or newer. To run on machines without it, build a bundle where a
+compiler is available and ship the directory:
+
+```sh
+syrup bundle ops-bundle find_largest_face find_words   # or syrup.bundle(...)
+SYRUP_MODE=frozen SYRUP_CACHE_DIR=ops-bundle python app.py
+```
+
+Bundles are per platform; a frozen run of an operation that is not in the
+bundle, or a bundle built for another platform, fails with `not_prepared`
+and says which.
+
 [docs/contract.md](docs/contract.md) has the grammar, the result contract
 and every way an operation can fail; [docs/architecture.md](docs/architecture.md)
 the design.
@@ -152,7 +166,7 @@ on a domain edition, so this repository stands alone.
 - Live capture is Windows-only. Other platforms consume file-based frames.
 - Operations by name currently cover faces, printed words, and colour
   regions and bars. Compiling a new operation needs `rustc` where it first
-  runs (or a cache prepared elsewhere, with `SYRUP_MODE=frozen`).
+  runs, or a bundle prepared elsewhere.
 
 ## Syrup and MapleSyrup
 

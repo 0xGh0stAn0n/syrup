@@ -47,6 +47,7 @@ __all__ = [
     "SyrupError",
     "ValidationError",
     "add_target",
+    "bundle",
     "cache_dir",
     "define",
     "ops",
@@ -212,6 +213,16 @@ def _detection(box):
         raise ValueError(f"a detection is (x, y, w, h, score) or (x, y, w, h, score, text), got {box!r}")
     x, y, w, h, score = (float(v) for v in box[:5])
     return x, y, w, h, score, str(box[5]) if len(box) == 6 else None
+
+
+def bundle(path, *names):
+    """Compile `names` and copy them into the bundle directory `path`.
+
+    A machine without a Rust compiler runs them with SYRUP_MODE=frozen and
+    SYRUP_CACHE_DIR=path. Bundles are per platform; adding to an existing
+    bundle keeps what it holds.
+    """
+    return json.loads(_call(_native.bundle, os.fspath(path), list(names)))
 
 
 def cache_dir():

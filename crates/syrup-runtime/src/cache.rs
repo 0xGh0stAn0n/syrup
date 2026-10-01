@@ -2,6 +2,7 @@
 //! published with a single rename, so readers only ever see complete ones.
 //! Published artifacts are never modified; damaged ones are moved aside.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -49,6 +50,44 @@ pub struct Manifest {
 
 pub struct Store {
     root: PathBuf,
+}
+
+/// `bundle.json`: which operations a bundle holds and what it was built for.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BundleIndex {
+    pub target: String,
+    pub abi_version: u32,
+    pub codegen: u32,
+    /// Operation name to artifact key.
+    pub operations: BTreeMap<String, String>,
+}
+
+impl BundleIndex {
+    fn current() -> BundleIndex {
+        BundleIndex {
+            target: HOST_TARGET.to_string(),
+            abi_version: SYRUP_ABI_VERSION,
+            codegen: CODEGEN_VERSION,
+            operations: BTreeMap::new(),
+        }
+    }
+
+    /// Why this bundle cannot serve this build of Syrup, if it cannot.
+    pub fn incompatibility(&self) -> Option<String> {
+        if self.target != HOST_TARGET {
+            Some(format!(
+                "the bundle was built for {}, and this machine is {HOST_TARGET}",
+                self.target
+            ))
+        } else if self.abi_version != SYRUP_ABI_VERSION || self.codegen != CODEGEN_VERSION {
+            Some(format!(
+                "the bundle was built by another Syrup version (ABI {}, codegen {}; this is ABI {SYRUP_ABI_VERSION}, codegen {CODEGEN_VERSION})",
+                self.abi_version, self.codegen
+            ))
+        } else {
+            None
+        }
+    }
 }
 
 pub fn sha256_file(path: &Path) -> io::Result<String> {
@@ -196,6 +235,58 @@ impl Store {
         let dir = self.artifact_dir(key);
         fs::rename(&dir, &target)
             .map_err(|e| SyrupError::io(Stage::Load, "cannot move aside", &dir, e))
+    }
+
+    pub fn bundle_index(&self) -> Option<BundleIndex> {
+        let text = fs::read_to_string(self.root.join("bundle.json")).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    /// Copies published artifacts into the bundle at `dest`, adding to what
+    /// is already there. `operations` maps names to keys published here.
+    pub fn export(&self, dest: &Path, operations: &[(String, String)]) -> Result<BundleIndex> {
+        let bundle = Store::new(dest.to_path_buf());
+        let mut index = match bundle.bundle_index() {
+            Some(index) => {
+                if let Some(why) = index.incompatibility() {
+                    return Err(SyrupError::new(
+                        Stage::Compile,
+                        ErrorKind::Conflicting,
+                        format!("cannot add to {}: {why}", dest.display()),
+                    ));
+                }
+                index
+            }
+            None => BundleIndex::current(),
+        };
+        for (name, key) in operations {
+            let source = self.artifact_dir(key);
+            let target = bundle.artifact_dir(key);
+            if !target.join("manifest.json").exists() {
+                let staging = bundle.staging(key)?;
+                for file in fs::read_dir(&source)
+                    .map_err(|e| SyrupError::io(Stage::Compile, "cannot read", &source, e))?
+                {
+                    let from = file
+                        .map_err(|e| SyrupError::io(Stage::Compile, "cannot read", &source, e))?
+                        .path();
+                    let to = staging.join(from.file_name().expect("entries have names"));
+                    fs::copy(&from, &to)
+                        .map_err(|e| SyrupError::io(Stage::Compile, "cannot copy", &from, e))?;
+                }
+                bundle.publish(&staging, key)?;
+            }
+            bundle.open(key)?;
+            index.operations.insert(name.clone(), key.clone());
+        }
+        let _ = fs::remove_dir_all(dest.join("staging"));
+        let path = dest.join("bundle.json");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&index).expect("indexes serialize"),
+        )
+        .map_err(|e| SyrupError::io(Stage::Compile, "cannot write", &path, e))?;
+        Ok(index)
     }
 
     pub fn list(&self) -> Vec<Manifest> {

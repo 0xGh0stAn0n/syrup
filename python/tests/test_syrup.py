@@ -192,3 +192,16 @@ def test_colour_regions_are_found_in_arrays():
         syrup.ops.find_regions
     assert e.value.kind == "ambiguous"
     assert syrup.define("alarm_bars", find="bars", color="red").plan_hash == syrup.resolve("find_red_bars").plan_hash
+
+
+def test_bundles_run_frozen_without_a_compiler(tmp_path):
+    index = syrup.bundle(tmp_path / "bundle", "find_largest_face")
+    assert list(index["operations"]) == ["find_largest_face"]
+    script = (
+        "import syrup;"
+        f"r = syrup.ops.find_biggest_face({str(FIXTURES / 'astronaut.jpg')!r});"
+        "print(len(r), r.provenance.artifact_status)"
+    )
+    env = dict(os.environ, SYRUP_MODE="frozen", SYRUP_CACHE_DIR=str(tmp_path / "bundle"), SYRUP_RUSTC="/nonexistent")
+    out = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, check=True)
+    assert out.stdout.split() == ["1", "loaded_from_disk"]

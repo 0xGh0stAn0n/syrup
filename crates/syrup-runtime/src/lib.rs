@@ -36,7 +36,7 @@ pub mod providers;
 mod runtime;
 mod validate;
 
-pub use cache::{Manifest, Store};
+pub use cache::{BundleIndex, Manifest, Store};
 pub use contract::{
     ArtifactStatus, BoxF, FindResult, Found, ImageInput, Keypoint, OwnedImage, RunParams,
 };

@@ -279,6 +279,14 @@ fn decode_image(py: Python<'_>, path: PathBuf) -> PyResult<(Py<PyBytes>, u32, u3
 }
 
 #[pyfunction]
+fn bundle(py: Python<'_>, path: PathBuf, names: Vec<String>) -> PyResult<String> {
+    let runtime = runtime()?;
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let index = py.detach(|| runtime.bundle(&path, &names)).map_err(raise)?;
+    Ok(serde_json::to_string(&index).expect("indexes serialize"))
+}
+
+#[pyfunction]
 fn cache_dir() -> PyResult<PathBuf> {
     Ok(runtime()?.store().root().to_path_buf())
 }
@@ -291,6 +299,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(define, m)?)?;
     m.add_function(wrap_pyfunction!(add_target, m)?)?;
     m.add_function(wrap_pyfunction!(decode_image, m)?)?;
+    m.add_function(wrap_pyfunction!(bundle, m)?)?;
     m.add_function(wrap_pyfunction!(cache_dir, m)?)?;
     Ok(())
 }

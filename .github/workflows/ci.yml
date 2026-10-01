@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -34,7 +34,11 @@ jobs:
         run: cargo build --workspace --all-targets
 
   python:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -47,12 +51,14 @@ jobs:
         with:
           python-version: "3.11"
       - name: Lint the extension
+        if: runner.os == 'Linux'
         run: |
           cargo fmt --manifest-path crates/syrup-python/Cargo.toml -- --check
           cargo clippy --manifest-path crates/syrup-python/Cargo.toml -- -D warnings
+      - name: Install Tesseract
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y tesseract-ocr
       - name: Install
-        run: |
-          sudo apt-get update && sudo apt-get install -y tesseract-ocr
-          pip install "./python[test]" opencv-python-headless
+        run: pip install "./python[test]" opencv-python-headless
       - name: Test
         run: pytest python/tests
