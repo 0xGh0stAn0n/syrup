@@ -28,8 +28,13 @@ jobs:
       - name: Install Tesseract
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y tesseract-ocr
+      - name: Open a window to capture
+        if: runner.os == 'Windows'
+        run: Start-Process notepad
       - name: Test
         run: cargo test --workspace
+        env:
+          SYRUP_EXPECT_WINDOW: ${{ runner.os == 'Windows' && '1' || '' }}
       - name: Build
         run: cargo build --workspace --all-targets
 

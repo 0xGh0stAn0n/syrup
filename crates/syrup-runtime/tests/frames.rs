@@ -89,10 +89,19 @@ fn windows_are_captured_into_sessions() {
         ErrorKind::BadParameter
     );
 
-    // CI runners have a desktop with a few windows; capture whichever is first.
-    let Some(title) = WindowCapture::windows().into_iter().next() else {
-        eprintln!("no capturable windows; skipping");
-        return;
+    // CI opens Notepad first and sets SYRUP_EXPECT_WINDOW, so there the
+    // capture cannot be skipped.
+    let windows = WindowCapture::windows();
+    let title = match windows
+        .iter()
+        .find(|t| t.contains("Notepad"))
+        .or(windows.first())
+    {
+        Some(title) => title.clone(),
+        None if std::env::var_os("SYRUP_EXPECT_WINDOW").is_some() => {
+            panic!("no capturable windows, but SYRUP_EXPECT_WINDOW is set")
+        }
+        None => return,
     };
     let cache = TempDir::new();
     let runtime = Runtime::new(config(&cache.0));
