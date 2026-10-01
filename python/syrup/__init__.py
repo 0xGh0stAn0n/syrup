@@ -165,16 +165,18 @@ def resolve(name):
     return Operation(_call(_native.resolve, name))
 
 
-def define(name, *, find, region=None, order=None, limit=None, min_area_pct=None, max_area_pct=None):
+def define(name, *, find, color=None, region=None, order=None, limit=None, min_area_pct=None, max_area_pct=None):
     """Give a name outside the grammar an explicit meaning.
 
-    `region` is a region name such as "top_half", "region" for a per-call
-    region, or fractions (x, y, w, h) of the image. `order` is one of
-    "confidence", "size", "area_asc", "left_to_right", "right_to_left",
-    "top_to_bottom" or "bottom_to_top".
+    `color` is required for regions and bars ("red", "blue", ...). `region`
+    is a region name such as "top_half", "region" for a per-call region, or
+    fractions (x, y, w, h) of the image. `order` is one of "confidence",
+    "size", "area_asc", "left_to_right", "right_to_left", "top_to_bottom" or
+    "bottom_to_top".
     """
     spec = {
         "find": find,
+        "color": color,
         "region": list(region) if isinstance(region, (tuple, list)) else region,
         "order": order,
         "limit": limit,

@@ -120,6 +120,7 @@ fn resolve(name: &str) -> PyResult<NativeOperation> {
 #[serde(deny_unknown_fields)]
 struct Spec {
     find: String,
+    color: Option<String>,
     region: Option<RegionArg>,
     order: Option<String>,
     limit: Option<u32>,
@@ -144,6 +145,13 @@ fn intent_from(spec: Spec) -> Result<Intent, SyrupError> {
         )
         .with_hint(format!("known targets: {}", catalog::known_targets()))
     })?;
+    let color = match spec.color {
+        None => None,
+        Some(name) => Some(
+            catalog::color_named(&name)
+                .ok_or_else(|| malformed(format!("{name:?} is not a colour Syrup knows")))?,
+        ),
+    };
     let region = match spec.region {
         None => None,
         Some(RegionArg::Named(name)) => Some(
@@ -167,6 +175,7 @@ fn intent_from(spec: Spec) -> Result<Intent, SyrupError> {
     };
     Ok(Intent {
         target,
+        color,
         region,
         order,
         limit: spec.limit,

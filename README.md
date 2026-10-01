@@ -143,9 +143,9 @@ on a domain edition, so this repository stands alone.
 - Tesseract must be installed separately for OCR (`TESSERACT_BIN` or
   `PATH`); without it, OCR reports itself unavailable rather than failing.
 - Live capture is Windows-only. Other platforms consume file-based frames.
-- Operations by name currently cover faces and printed words, and compiling
-  a new operation needs `rustc` where it first runs (or a cache prepared
-  elsewhere, with `SYRUP_MODE=frozen`).
+- Operations by name currently cover faces, printed words, and colour
+  regions and bars. Compiling a new operation needs `rustc` where it first
+  runs (or a cache prepared elsewhere, with `SYRUP_MODE=frozen`).
 
 ## Syrup and MapleSyrup
 
