@@ -305,13 +305,19 @@ impl Operation {
         if let Some(loaded) = self.cached() {
             return Ok((loaded, ArtifactStatus::InMemory));
         }
-        let _lock = inner.store.lock(&self.key)?;
+        let frozen = inner.config.mode == Mode::Frozen;
+        // A frozen cache may be mounted read-only, so frozen mode never writes.
+        let _lock = if frozen {
+            None
+        } else {
+            Some(inner.store.lock(&self.key)?)
+        };
         let (loaded, status) = match inner.store.open(&self.key) {
             Ok(Some((manifest, library))) => {
                 let module = Module::load(&library, &self.plan_hash)?;
                 (Loaded { module, manifest }, ArtifactStatus::LoadedFromDisk)
             }
-            Ok(None) if inner.config.mode == Mode::Frozen => {
+            Ok(None) if frozen => {
                 return Err(SyrupError::new(
                     Stage::Load,
                     ErrorKind::NotPrepared,
@@ -320,7 +326,7 @@ impl Operation {
                 .with_hint("run `syrup prepare` with the same cache directory where a compiler is available")
                 .with_detail("artifact", self.key.clone()));
             }
-            Err(e) if e.kind == ErrorKind::Integrity && inner.config.mode == Mode::Development => {
+            Err(e) if e.kind == ErrorKind::Integrity && !frozen => {
                 inner.store.quarantine(&self.key)?;
                 (self.build()?, ArtifactStatus::Compiled)
             }
@@ -492,8 +498,12 @@ impl Operation {
         // call returns, and `image` outlives it.
         let code = unsafe { loaded.module.run(&table, &image.as_abi(), &abi_params) };
         let execute_ms = executed_at.elapsed().as_secs_f64() * 1000.0;
+        // A provider failure stands even if the module ignored it.
+        if let Some(e) = host.error.take() {
+            return Err(e);
+        }
         if code != SYRUP_OK {
-            return Err(host.error.take().unwrap_or_else(|| module_error(code)));
+            return Err(module_error(code));
         }
 
         let limit = [self.intent.limit, params.max_results]
