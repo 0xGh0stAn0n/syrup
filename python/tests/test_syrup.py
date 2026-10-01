@@ -205,3 +205,21 @@ def test_bundles_run_frozen_without_a_compiler(tmp_path):
     env = dict(os.environ, SYRUP_MODE="frozen", SYRUP_CACHE_DIR=str(tmp_path / "bundle"), SYRUP_RUSTC="/nonexistent")
     out = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, check=True)
     assert out.stdout.split() == ["1", "loaded_from_disk"]
+
+
+def test_measurements_carry_a_value():
+    page = np.full((120, 300, 3), 30, np.uint8)
+    page[100:110, 20:220] = (70, 70, 78)  # the bar's track
+    page[100:110, 20:70] = (210, 40, 40)  # a quarter full
+    (bar,) = syrup.ops.measure_fill_of_red_bars(page)
+    assert abs(bar.value - 0.25) < 0.02 and bar.box.y == 100
+
+    crisp = PILImage.open(FIXTURES / "words.png").convert("RGB")
+    readability = syrup.define("readability", find="image", measure="sharpness")
+    (whole,) = readability(crisp)
+    assert whole.label == "image" and whole.value >= 0.35
+    assert syrup.ops.measure_sharpness(crisp)[0].value == whole.value
+    assert syrup.ops.find_red_bars(page)[0].value is None
+    with pytest.raises(syrup.IntentError) as e:
+        syrup.ops.measure_fill_of_faces
+    assert e.value.kind == "unsupported"

@@ -48,6 +48,7 @@ impl Provider for Tesseract {
                 w: b.w as f32,
                 h: b.h as f32,
                 score: word.confidence,
+                value: 0.0,
                 n_keypoints: 0,
                 keypoints: [0.0; 2 * SYRUP_MAX_KEYPOINTS],
                 payload: 0,

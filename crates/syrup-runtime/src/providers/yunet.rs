@@ -157,6 +157,7 @@ impl Provider for YuNet {
                     w: bw,
                     h: bh,
                     score,
+                    value: 0.0,
                     n_keypoints: SYRUP_MAX_KEYPOINTS as u32,
                     keypoints,
                     payload: 0,

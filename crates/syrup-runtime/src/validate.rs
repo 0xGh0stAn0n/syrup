@@ -13,7 +13,7 @@ use crate::error::{ErrorKind, Result, Stage, SyrupError};
 use crate::intent::PixelRect;
 use crate::interp::{self, Host, group_runs};
 use crate::loader::Module;
-use crate::plan::{Plan, Step};
+use crate::plan::{Measurement, Plan, Step};
 
 const SIZES: &[(u32, u32)] = &[
     (1, 1),
@@ -78,12 +78,52 @@ fn mock_detections(seed: u64, capability: u32, view: PixelRect) -> Vec<SyrupDete
             w: rng.range(-0.05, 0.8) * w,
             h: rng.range(-0.05, 0.8) * h,
             score: [0.0, 0.3, 0.5, 0.6, 0.6, 0.9, 1.0, rng.unit()][rng.below(8) as usize],
+            value: 0.0,
             n_keypoints: [0, 5, 7][rng.below(3) as usize],
             keypoints,
             payload: rng.next(),
         });
     }
     out
+}
+
+/// A value that depends only on the measurement and the box, rounded so
+/// float noise in the box cannot change it; one in five cannot be measured.
+fn mock_value(seed: u64, what: &SyrupMeasure, d: &SyrupDetection) -> f32 {
+    let q = |v: f32| (v * 16.0).round() as i64 as u64;
+    let mut rng = SplitMix(
+        seed ^ ((what.kind as u64) << 60)
+            ^ ((what.hue_lo as u64) << 50)
+            ^ q(d.x).rotate_left(36)
+            ^ q(d.y).rotate_left(24)
+            ^ q(d.w).rotate_left(12)
+            ^ q(d.h),
+    );
+    if rng.below(5) == 0 {
+        f32::NAN
+    } else {
+        rng.unit()
+    }
+}
+
+/// A call to `measure`, as made: what, where, and the boxes' geometry.
+type Measured = (SyrupMeasure, PixelRect, Vec<[f32; 4]>);
+
+fn geometry(boxes: &[SyrupDetection]) -> Vec<[f32; 4]> {
+    boxes.iter().map(|d| [d.x, d.y, d.w, d.h]).collect()
+}
+
+fn same_measured(a: &[Measured], b: &[Measured]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(a, b)| {
+            a.0 == b.0
+                && a.1 == b.1
+                && a.2.len() == b.2.len()
+                && a.2
+                    .iter()
+                    .zip(&b.2)
+                    .all(|(p, q)| p.iter().zip(q).all(|(x, y)| (x - y).abs() <= 1e-4))
+        })
 }
 
 struct MockHost {
@@ -98,6 +138,7 @@ struct MockHost {
     rects: Vec<SyrupRect>,
     calls: Vec<PixelRect>,
     groups: Vec<Grouping>,
+    measures: Vec<Measured>,
     out: Vec<SyrupDetection>,
     fault: Option<String>,
 }
@@ -190,6 +231,40 @@ unsafe extern "C" fn mock_group(
     SYRUP_OK
 }
 
+unsafe extern "C" fn mock_measure(
+    ctx: *mut c_void,
+    what: *const SyrupMeasure,
+    view: *const SyrupImageView,
+    boxes: *const SyrupDetection,
+    n_boxes: usize,
+    values: *mut f32,
+) -> i32 {
+    // SAFETY: as in mock_detect; `boxes` and `values` hold `n_boxes` items.
+    let host = unsafe { &mut *(ctx as *mut MockHost) };
+    let (what, boxes) = unsafe {
+        (
+            *what,
+            match n_boxes {
+                0 => &[][..],
+                n => std::slice::from_raw_parts(boxes, n),
+            },
+        )
+    };
+    match host.locate(unsafe { &*view }) {
+        Ok(rect) => {
+            host.measures.push((what, rect, geometry(boxes)));
+            for (i, d) in boxes.iter().enumerate() {
+                unsafe { *values.add(i) = mock_value(host.seed, &what, d) };
+            }
+            SYRUP_OK
+        }
+        Err(fault) => {
+            host.fault = Some(fault);
+            SYRUP_ERR_PROVIDER
+        }
+    }
+}
+
 unsafe extern "C" fn mock_emit(ctx: *mut c_void, detection: *const SyrupDetection) -> i32 {
     // SAFETY: as in mock_detect.
     unsafe { (*(ctx as *mut MockHost)).out.push(*detection) };
@@ -200,6 +275,7 @@ struct Oracle {
     seed: u64,
     calls: Vec<PixelRect>,
     groups: Vec<Grouping>,
+    measures: Vec<Measured>,
 }
 
 impl Host for Oracle {
@@ -211,6 +287,20 @@ impl Host for Oracle {
     fn group(&mut self, runs: &[SyrupRun], min_height: u32, max_gap: u32) -> Vec<SyrupRect> {
         self.groups.push((runs.to_vec(), min_height, max_gap));
         group_runs(runs, min_height, max_gap)
+    }
+
+    fn measure(
+        &mut self,
+        what: Measurement,
+        view: PixelRect,
+        boxes: &[SyrupDetection],
+    ) -> Result<Vec<f32>> {
+        let what = what.abi();
+        self.measures.push((what, view, geometry(boxes)));
+        Ok(boxes
+            .iter()
+            .map(|d| mock_value(self.seed, &what, d))
+            .collect())
     }
 }
 
@@ -290,6 +380,26 @@ fn synthetic_image(
             }
         }
     }
+    // Solid bars in the plan's hues, so plans that select among several
+    // colour regions have several to select from.
+    for &(lo, hi) in &hues {
+        for _ in 0..rng.below(4) {
+            let w = 8 + rng.below(width as u64) as usize;
+            let h = 2 + rng.below(1 + w as u64 / 4) as usize;
+            let (x0, y0) = (
+                rng.below(width as u64) as usize,
+                rng.below(height as u64) as usize,
+            );
+            let span = (hi + 360 - lo) % 360;
+            let hue = (lo as f32 + rng.unit() * span as f32) % 360.0;
+            let [r, g, b] = from_hsv(hue, 0.5 + 0.5 * rng.unit(), 0.5 + 0.5 * rng.unit());
+            for y in y0..(y0 + h).min(height as usize) {
+                for x in x0..(x0 + w).min(width as usize) {
+                    image[y * stride + x * c..][..c].copy_from_slice(&[r, g, b, 255][..c]);
+                }
+            }
+        }
+    }
     image
 }
 
@@ -301,6 +411,7 @@ fn same(a: &SyrupDetection, b: &SyrupDetection) -> bool {
         && close(a.w, b.w)
         && close(a.h, b.h)
         && close(a.score, b.score)
+        && close(a.value, b.value)
         && a.n_keypoints == b.n_keypoints
         && a.payload == b.payload
         && a.keypoints[..2 * n]
@@ -344,6 +455,7 @@ pub fn check(module: &Module, plan: &Plan) -> Result<u32> {
                 rects: vec![],
                 calls: vec![],
                 groups: vec![],
+                measures: vec![],
                 out: vec![],
                 fault: None,
             };
@@ -354,6 +466,7 @@ pub fn check(module: &Module, plan: &Plan) -> Result<u32> {
                 detect: mock_detect,
                 emit: mock_emit,
                 group: mock_group,
+                measure: mock_measure,
             };
             let input = SyrupImageView {
                 data: image.as_ptr(),
@@ -369,6 +482,7 @@ pub fn check(module: &Module, plan: &Plan) -> Result<u32> {
                 seed,
                 calls: vec![],
                 groups: vec![],
+                measures: vec![],
             };
             let pixels = ImageInput::with_stride(&image, width, height, stride, channels)?;
             let expected = interp::run(plan, &pixels, &params, &mut oracle)?;
@@ -398,6 +512,12 @@ pub fn check(module: &Module, plan: &Plan) -> Result<u32> {
                 return Err(mismatch(format!(
                     "module grouped {:?}, expected {:?}",
                     host.groups, oracle.groups
+                )));
+            }
+            if !same_measured(&host.measures, &oracle.measures) {
+                return Err(mismatch(format!(
+                    "module measured {:?}, expected {:?}",
+                    host.measures, oracle.measures
                 )));
             }
             if host.out.len() != expected.len()
@@ -476,6 +596,8 @@ mod tests {
         for (i, name) in [
             "find_2_largest_faces_in_region_larger_than_1pct",
             "find_red_bars_in_bottom_half",
+            "measure_fill_of_2_largest_blue_bars_in_top_half",
+            "measure_sharpness_in_region",
         ]
         .into_iter()
         .enumerate()
@@ -530,6 +652,21 @@ mod tests {
     fn a_loosened_hue_test_is_caught() {
         let built = build("find_green_regions", "hue", |s| {
             s.replace("h >= 70.0 && h <= 165.0", "h >= 60.0 && h <= 175.0")
+        });
+        mismatch(&built);
+    }
+
+    #[test]
+    fn measuring_before_the_limit_is_caught() {
+        // Measuring every bar and then keeping the largest is not the same
+        // as measuring the largest: unmeasurable bars change which one wins.
+        let built = build("measure_fill_of_largest_red_bar", "measure", |s| {
+            let measure = s.lines().find(|l| l.contains("= measure(host")).unwrap();
+            s.replace("v6.truncate(1);", "v6.truncate(usize::MAX);")
+                .replace(
+                    measure,
+                    &format!("{measure}\n    let mut v8 = v8;\n    v8.truncate(1);"),
+                )
         });
         mismatch(&built);
     }

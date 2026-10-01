@@ -45,6 +45,7 @@ impl Provider for Corner {
                 w: 20.0,
                 h: 20.0,
                 score: 0.9,
+                value: 0.0,
                 n_keypoints: 0,
                 keypoints: [0.0; 10],
                 payload: 0,

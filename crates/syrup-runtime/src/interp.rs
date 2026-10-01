@@ -14,13 +14,22 @@ use crate::catalog::Capability;
 use crate::contract::ImageInput;
 use crate::error::{ErrorKind, Result, Stage, SyrupError};
 use crate::intent::{OrderKey, PixelRect, RegionSpec};
-use crate::plan::{Plan, Step};
+use crate::plan::{Measurement, Plan, Step};
 
-/// What the host gives a plan: detectors, and the core's region grouping.
+/// What the host gives a plan: detectors, the core's region grouping, and
+/// the core's measurements.
 pub trait Host {
     /// `view` is in input pixels and never empty.
     fn detect(&mut self, capability: Capability, view: PixelRect) -> Result<Vec<SyrupDetection>>;
     fn group(&mut self, runs: &[SyrupRun], min_height: u32, max_gap: u32) -> Vec<SyrupRect>;
+    /// One value per box, NaN where it cannot be measured; `boxes` is never
+    /// empty and is in `view`'s pixels.
+    fn measure(
+        &mut self,
+        what: Measurement,
+        view: PixelRect,
+        boxes: &[SyrupDetection],
+    ) -> Result<Vec<f32>>;
 }
 
 /// The core's grouping, as the real host and the validator's mock use it.
@@ -180,6 +189,7 @@ pub fn run(
                                 w: r.w as f32,
                                 h: r.h as f32,
                                 score: hits as f32 / (r.w * r.h) as f32,
+                                value: 0.0,
                                 n_keypoints: 0,
                                 keypoints: [0.0; 2 * SYRUP_MAX_KEYPOINTS],
                                 payload: 0,
@@ -188,6 +198,43 @@ pub fn run(
                         .collect();
                     Value::Boxes(boxes)
                 }
+            }
+            Step::Whole { view: at } => {
+                let rect = view(&values, at)?;
+                let mut boxes = vec![];
+                if rect.w > 0 && rect.h > 0 {
+                    boxes.push(SyrupDetection {
+                        x: 0.0,
+                        y: 0.0,
+                        w: rect.w as f32,
+                        h: rect.h as f32,
+                        score: 1.0,
+                        value: 0.0,
+                        n_keypoints: 0,
+                        keypoints: [0.0; 2 * SYRUP_MAX_KEYPOINTS],
+                        payload: 0,
+                    });
+                }
+                Value::Boxes(boxes)
+            }
+            Step::Measure {
+                boxes,
+                view: at,
+                what,
+            } => {
+                let rect = view(&values, at)?;
+                let mut kept = take(&mut values, boxes)?;
+                if !kept.is_empty() {
+                    let measured = host.measure(what, rect, &kept)?;
+                    if measured.len() != kept.len() {
+                        return Err(invalid("the host measured a different number of boxes"));
+                    }
+                    for (d, value) in kept.iter_mut().zip(measured) {
+                        d.value = value;
+                    }
+                    kept.retain(|d| d.value.is_finite());
+                }
+                Value::Boxes(kept)
             }
             Step::Restore { boxes, view: at } => {
                 let rect = view(&values, at)?;
@@ -269,6 +316,7 @@ pub fn restore(boxes: Vec<SyrupDetection>, view: PixelRect) -> Vec<SyrupDetectio
                 w,
                 h,
                 score: d.score,
+                value: d.value,
                 n_keypoints: n as u32,
                 keypoints,
                 payload: d.payload,
@@ -310,6 +358,7 @@ mod tests {
             w,
             h,
             score,
+            value: 0.0,
             n_keypoints: 0,
             keypoints: [0.0; 10],
             payload: 0,
@@ -341,6 +390,19 @@ mod tests {
 
         fn group(&mut self, runs: &[SyrupRun], min_height: u32, max_gap: u32) -> Vec<SyrupRect> {
             group_runs(runs, min_height, max_gap)
+        }
+
+        /// The box's width as a fraction of 100, or NaN for boxes wider than 50.
+        fn measure(
+            &mut self,
+            _: Measurement,
+            _: PixelRect,
+            boxes: &[SyrupDetection],
+        ) -> Result<Vec<f32>> {
+            Ok(boxes
+                .iter()
+                .map(|d| if d.w > 50.0 { f32::NAN } else { d.w / 100.0 })
+                .collect())
         }
     }
 

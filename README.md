@@ -29,6 +29,15 @@ cached, and loaded. Later calls and later processes reuse the compiled
 module. Names Syrup cannot honour fail at import with a reason:
 `find_best_face` is refused because "best" does not say by what.
 
+Measurements compose the same way, using the core's own measures:
+
+```python
+from syrup.ops import measure_fill_of_largest_red_bar_in_bottom_third, measure_sharpness_of_words
+
+(health,) = measure_fill_of_largest_red_bar_in_bottom_third(frame)  # health.value == 0.4
+blurry = [w for w in measure_sharpness_of_words(frame) if w.value < 0.35]
+```
+
 Detectors from any Python library become nouns the same way:
 
 ```python

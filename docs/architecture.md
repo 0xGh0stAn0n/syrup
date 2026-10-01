@@ -46,7 +46,8 @@ from syrup.ops import find_face        Runtime::resolve("find_face")
 1. **The generated module is the operation.** Region selection, the detector
    call, coordinate restoration, clipping, filtering, ordering and limiting
    are emitted from the plan. Only learned or external detectors (YuNet,
-   Tesseract) and the core's region grouping live in the host. For colour
+   Tesseract), the core's region grouping and the core's measurements
+   (sharpness, bar fill) live in the host. For colour
    targets the per-pixel test itself is generated, specialised to the
    colour, and validated against the core's `is_color_pixel`.
 2. **Generated code has no dependencies.** The ONNX runtime and the model

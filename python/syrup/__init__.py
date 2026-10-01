@@ -168,14 +168,17 @@ def resolve(name):
     return Operation(_call(_native.resolve, name))
 
 
-def define(name, *, find, color=None, region=None, order=None, limit=None, min_area_pct=None, max_area_pct=None):
+def define(
+    name, *, find, color=None, region=None, order=None, limit=None, min_area_pct=None, max_area_pct=None, measure=None
+):
     """Give a name outside the grammar an explicit meaning.
 
     `color` is required for regions and bars ("red", "blue", ...). `region`
     is a region name such as "top_half", "region" for a per-call region, or
     fractions (x, y, w, h) of the image. `order` is one of "confidence",
     "size", "area_asc", "left_to_right", "right_to_left", "top_to_bottom" or
-    "bottom_to_top".
+    "bottom_to_top". `measure` ("sharpness" or "fill") makes it a
+    measurement: each result carries the quantity as `value`.
     """
     spec = {
         "find": find,
@@ -185,6 +188,7 @@ def define(name, *, find, color=None, region=None, order=None, limit=None, min_a
         "limit": limit,
         "min_area_pct": min_area_pct,
         "max_area_pct": max_area_pct,
+        "measure": measure,
     }
     spec = {k: v for k, v in spec.items() if v is not None}
     return Operation(_call(_native.define, name, json.dumps(spec)))

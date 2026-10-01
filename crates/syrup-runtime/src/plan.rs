@@ -8,11 +8,57 @@ use std::fmt::Write as _;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::catalog::{self, Capability, Finder};
+use crate::abi::{SYRUP_MEASURE_FILL, SYRUP_MEASURE_SHARPNESS, SyrupMeasure};
+use crate::catalog::{self, Capability, Finder, Quantity};
 use crate::error::{ErrorKind, Result, Stage, SyrupError};
 use crate::intent::{Intent, NormRect, OrderKey, RegionSpec};
 
 pub const IR_VERSION: u32 = 1;
+
+/// What a `Measure` step asks the host for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(tag = "quantity", rename_all = "snake_case")]
+pub enum Measurement {
+    Sharpness,
+    /// Filled pixels are those of the bar's colour, as `FindColor` matches them.
+    Fill {
+        hue: (u32, u32),
+        min_saturation_pct: u32,
+        min_value_pct: u32,
+    },
+}
+
+impl Measurement {
+    pub fn abi(self) -> SyrupMeasure {
+        match self {
+            Measurement::Sharpness => SyrupMeasure {
+                kind: SYRUP_MEASURE_SHARPNESS,
+                hue_lo: 0,
+                hue_hi: 0,
+                min_saturation_pct: 0,
+                min_value_pct: 0,
+            },
+            Measurement::Fill {
+                hue,
+                min_saturation_pct,
+                min_value_pct,
+            } => SyrupMeasure {
+                kind: SYRUP_MEASURE_FILL,
+                hue_lo: hue.0,
+                hue_hi: hue.1,
+                min_saturation_pct,
+                min_value_pct,
+            },
+        }
+    }
+
+    pub fn quantity(self) -> Quantity {
+        match self {
+            Measurement::Sharpness => Quantity::Sharpness,
+            Measurement::Fill { .. } => Quantity::Fill,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -37,6 +83,10 @@ pub enum Step {
         min_run: u32,
         min_height: u32,
         max_gap: u32,
+    },
+    /// The whole of `view` as one box with score 1, or none if it is empty.
+    Whole {
+        view: usize,
     },
     /// Moves boxes from `view`'s space to input space and clips them to the
     /// view; boxes left without area are dropped.
@@ -69,6 +119,13 @@ pub enum Step {
     LimitParam {
         boxes: usize,
     },
+    /// Sets each box's value; boxes the host cannot measure are dropped.
+    /// `view` is the input, which the restored boxes are in.
+    Measure {
+        boxes: usize,
+        view: usize,
+        what: Measurement,
+    },
     Emit {
         boxes: usize,
     },
@@ -80,8 +137,9 @@ impl Step {
             Step::Input => vec![],
             Step::SelectRegion { view, .. }
             | Step::Detect { view, .. }
-            | Step::FindColor { view, .. } => vec![view],
-            Step::Restore { boxes, view } => vec![boxes, view],
+            | Step::FindColor { view, .. }
+            | Step::Whole { view } => vec![view],
+            Step::Restore { boxes, view } | Step::Measure { boxes, view, .. } => vec![boxes, view],
             Step::FilterConfidence { boxes }
             | Step::FilterAspect { boxes, .. }
             | Step::FilterArea { boxes, .. }
@@ -152,6 +210,7 @@ impl Plan {
             (Finder::Color { .. }, None) => {
                 return Err(invalid("a colour target without a colour"));
             }
+            (Finder::Whole, _) => push(Step::Whole { view }),
         };
         boxes = push(Step::Restore { boxes, view });
         boxes = push(Step::FilterConfidence { boxes });
@@ -177,6 +236,22 @@ impl Plan {
             boxes = push(Step::Limit { boxes, n });
         }
         boxes = push(Step::LimitParam { boxes });
+        if let Some(quantity) = intent.measure {
+            let what = match (quantity, intent.color) {
+                (Quantity::Sharpness, _) => Measurement::Sharpness,
+                (Quantity::Fill, Some(color)) => Measurement::Fill {
+                    hue: catalog::color(color).hue,
+                    min_saturation_pct: catalog::MIN_SATURATION_PCT,
+                    min_value_pct: catalog::MIN_VALUE_PCT,
+                },
+                (Quantity::Fill, None) => return Err(invalid("fill needs the bar's colour")),
+            };
+            boxes = push(Step::Measure {
+                boxes,
+                view: 0,
+                what,
+            });
+        }
         push(Step::Emit { boxes });
 
         let plan = Plan {
@@ -254,13 +329,38 @@ impl Plan {
                 {
                     return Err(invalid(format!("step {i}: colour thresholds out of range")));
                 }
-                Step::Detect { view, .. } | Step::FindColor { view, .. } => match types[view] {
-                    ValueType::View(space) => ValueType::Boxes {
-                        space,
-                        clipped: false,
-                    },
-                    other => return Err(invalid(format!("step {i} detects in {other:?}"))),
-                },
+                Step::Measure {
+                    what:
+                        Measurement::Fill {
+                            hue,
+                            min_saturation_pct,
+                            min_value_pct,
+                        },
+                    ..
+                } if hue.0 >= 360
+                    || hue.1 >= 360
+                    || min_saturation_pct > 100
+                    || min_value_pct > 100 =>
+                {
+                    return Err(invalid(format!("step {i}: fill thresholds out of range")));
+                }
+                Step::Measure { boxes, view, .. } => {
+                    if types[view] != ValueType::View(Space::Input) {
+                        return Err(invalid(format!(
+                            "step {i} measures against something other than the input"
+                        )));
+                    }
+                    restored(boxes)?
+                }
+                Step::Detect { view, .. } | Step::FindColor { view, .. } | Step::Whole { view } => {
+                    match types[view] {
+                        ValueType::View(space) => ValueType::Boxes {
+                            space,
+                            clipped: false,
+                        },
+                        other => return Err(invalid(format!("step {i} detects in {other:?}"))),
+                    }
+                }
                 Step::Restore { boxes, view } => match (types[boxes], types[view]) {
                     (ValueType::Boxes { space, .. }, ValueType::View(view_space))
                         if space == view_space =>
@@ -357,6 +457,11 @@ impl Plan {
                 Step::Detect { view, capability } => {
                     format!("detect {} in v{view}", capability.as_str())
                 }
+                Step::Whole { view } => format!("all of v{view}, as one item"),
+                Step::Measure { boxes, view, what } => format!(
+                    "measure the {} of each of v{boxes} in v{view}; drop those that cannot be measured",
+                    what.quantity().name()
+                ),
                 Step::Restore { boxes, view } => {
                     format!("restore v{boxes} from v{view} to input coordinates, clipped")
                 }

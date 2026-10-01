@@ -19,7 +19,11 @@ an ordinary `NameError`; Python has no honest hook for that.
 ## 2. Grammar (v1)
 
 ```text
-name      := verb "_" [count "_" selector "_" | selector "_" | "all_"] [colour "_"] target ("_" clause)*
+name      := find_name | measure_name
+find_name := verb "_" body
+body      := [count "_" selector "_" | selector "_" | "all_"] [colour "_"] target ("_" clause)*
+measure_name := "measure_" quantity ["_of_" body | "_in_" region]
+quantity  := sharpness | fill
 verb      := find | detect | locate
 target    := face | faces | human_face | human_faces | word | words
            | region | regions | blob | blobs | bar | bars
@@ -58,6 +62,22 @@ tall.
 | purple, violet | 255–290 |
 | magenta | 290–340 |
 
+`measure_*` operations return the same items as the matching `find_*`
+(or, without `_of_`, the image or region as one item labelled `image`),
+each with a `value` in [0, 1]. The generated module selects the items; the
+host measures them with the core's own functions, after ordering and
+limits, so `measure_fill_of_largest_red_bar` measures the largest bar and
+nothing else. An item that cannot be measured is left out, the same way a
+detector leaves out what it does not accept.
+
+| quantity | measures | from the core | cannot be measured when |
+|---|---|---|---|
+| `sharpness` | the share of strong horizontal luminance steps that are abrupt; below 0.35, text is too blurred to read reliably | `quality::assess_text_quality` | the item has fewer than 24 strong steps |
+| `fill` | how full a bar is: filled columns over the bar's track | `geometry::measure_bar_fill` | no track can be found next to the bar |
+
+`fill` is measured on bars only, and needs their colour
+(`measure_fill_of_red_bars`).
+
 Singular and plural mean the same: `find_face` returns every face, so
 `faces = find_face(img)` reads right. One result is spelled with a selector:
 `find_largest_face`. Names that differ only by synonym, number or clause
@@ -89,6 +109,8 @@ to one item.
 - `keypoints`: named points, same coordinates, clipped. Faces carry
   `right_eye`, `left_eye`, `nose_tip`, `right_mouth_corner`,
   `left_mouth_corner` (the subject's right and left).
+- `value`: the measured quantity for `measure_*` operations, otherwise
+  empty.
 - `text`: what a word says; empty for targets that do not read text. A
   word's confidence is Tesseract's, divided by 100. A region's or bar's is
   the share of its box's pixels that have the colour.
@@ -162,6 +184,9 @@ Refused rather than guessed:
 | `find_regions` | ambiguous | regions of which colour? |
 | `find_white_regions`, `find_red_faces` | unsupported | white has no hue; faces are not found by colour |
 | `find_cars`, `find_people` | unsupported | no capability finds that |
+| `measure_fill` | ambiguous | fill of what? |
+| `measure_fill_of_faces`, `measure_weight` | unsupported | fill is measured on bars; weight not at all |
+| `measure_sharpness_by_size` | conflicting | one image or region has nothing to order |
 | `find_faces_in_top_half_in_left_half` | conflicting | one region per operation |
 | any unknown word | malformed or unsupported | unknown words are never dropped |
 

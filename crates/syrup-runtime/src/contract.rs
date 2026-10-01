@@ -206,6 +206,8 @@ pub struct Found {
     pub keypoints: Vec<Keypoint>,
     /// What a word says, for targets that read text.
     pub text: Option<String>,
+    /// The measured quantity, in [0, 1], for `measure_*` operations.
+    pub value: Option<f32>,
 }
 
 /// How a run got its compiled module.

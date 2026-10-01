@@ -24,6 +24,8 @@ class Found:
     keypoints: dict[str, tuple[float, float]] = field(default_factory=dict)
     # What a word says, for targets that read text.
     text: str | None = None
+    # The measured quantity in [0, 1], for measure_* operations.
+    value: float | None = None
 
 
 @dataclass(frozen=True)
@@ -68,6 +70,7 @@ def from_json(text):
             f["confidence"],
             {k["name"]: (k["x"], k["y"]) for k in f["keypoints"]},
             f["text"],
+            f["value"],
         )
         for f in data["items"]
     ]

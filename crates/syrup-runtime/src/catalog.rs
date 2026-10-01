@@ -25,7 +25,36 @@ pub enum Target {
     Word,
     Region,
     Bar,
+    /// The searched image or region as one item; only measurements use it.
+    Image,
     Custom(Name),
+}
+
+/// What `measure_*` operations measure, each a fraction in [0, 1].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Quantity {
+    /// The share of strong luminance steps that are abrupt, as the core's
+    /// assess_text_quality measures it. Below 0.35 text is too blurred to
+    /// read reliably.
+    Sharpness,
+    /// How full a bar is, as the core's measure_bar_fill measures it.
+    Fill,
+}
+
+impl Quantity {
+    pub const ALL: [Quantity; 2] = [Quantity::Sharpness, Quantity::Fill];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Quantity::Sharpness => "sharpness",
+            Quantity::Fill => "fill",
+        }
+    }
+
+    pub fn named(word: &str) -> Option<Quantity> {
+        Quantity::ALL.into_iter().find(|q| q.name() == word)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
@@ -171,6 +200,8 @@ pub enum Finder {
         /// Keep regions at least this many times wider than tall.
         min_aspect: Option<u32>,
     },
+    /// The whole searched view, as one item.
+    Whole,
 }
 
 #[derive(Debug)]
@@ -248,6 +279,17 @@ pub const TARGETS: &[TargetEntry] = &[
         keypoints: &[],
         description: "bars of one colour, at least 3 times wider than tall, e.g. red_bars",
     },
+    TargetEntry {
+        target: Target::Image,
+        label: "image",
+        // No nouns: `find_image` would mean nothing; measure_sharpness does.
+        singular: &[],
+        plural: &[],
+        finder: Finder::Whole,
+        default_min_confidence: 0.0,
+        keypoints: &[],
+        description: "the searched image or region",
+    },
 ];
 
 /// Built-in targets, then those added at run time.
@@ -280,6 +322,7 @@ pub fn color_named(word: &str) -> Option<Color> {
 pub fn known_targets() -> String {
     all()
         .into_iter()
+        .filter(|e| !e.plural.is_empty())
         .map(|e| format!("{} ({})", e.plural[0], e.description))
         .collect::<Vec<_>>()
         .join("; ")

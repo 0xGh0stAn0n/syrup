@@ -8,7 +8,7 @@ use crate::error::{ErrorKind, Result, Stage, SyrupError};
 use crate::intent::{Intent, OrderKey, RegionSpec};
 use crate::plan::{Plan, Step};
 
-pub const CODEGEN_VERSION: u32 = 1;
+pub const CODEGEN_VERSION: u32 = 2;
 
 pub const EXPORTS: [&str; 3] = ["syrup_op_abi_version", "syrup_op_plan_hash", "syrup_op_run"];
 
@@ -56,6 +56,8 @@ enum Helper {
     SelectCaller,
     Detect,
     Color,
+    Whole,
+    Measure,
     Restore,
     TieBreak,
     Emit,
@@ -280,12 +282,60 @@ fn find_color(
             w: r.w as f32,
             h: r.h as f32,
             score: hits as f32 / (r.w * r.h) as f32,
+            value: 0.0,
             n_keypoints: 0,
             keypoints: [0.0; 2 * SYRUP_MAX_KEYPOINTS],
             payload: 0,
         });
     }
     Ok(out)
+}
+"#
+            }
+            Helper::Whole => {
+                r#"
+fn whole(window: &Window) -> Vec<SyrupDetection> {
+    if window.view.width == 0 || window.view.height == 0 {
+        return Vec::new();
+    }
+    vec![SyrupDetection {
+        x: 0.0,
+        y: 0.0,
+        w: window.view.width as f32,
+        h: window.view.height as f32,
+        score: 1.0,
+        value: 0.0,
+        n_keypoints: 0,
+        keypoints: [0.0; 2 * SYRUP_MAX_KEYPOINTS],
+        payload: 0,
+    }]
+}
+"#
+            }
+            Helper::Measure => {
+                r#"
+fn measure(
+    host: &SyrupHost,
+    what: &SyrupMeasure,
+    window: &Window,
+    mut boxes: Vec<SyrupDetection>,
+) -> Result<Vec<SyrupDetection>, i32> {
+    if boxes.is_empty() {
+        return Ok(boxes);
+    }
+    let mut values = vec![f32::NAN; boxes.len()];
+    // SAFETY: the host reads the boxes and writes one value per box during the call.
+    let status = unsafe {
+        (host.measure)(host.ctx, what, &window.view, boxes.as_ptr(), boxes.len(), values.as_mut_ptr())
+    };
+    if status != SYRUP_OK {
+        return Err(status);
+    }
+    for (d, value) in boxes.iter_mut().zip(values) {
+        d.value = value;
+    }
+    boxes.retain(|d| d.value.is_finite());
+    Ok(boxes)
 }
 "#
             }
@@ -318,6 +368,7 @@ fn restore(boxes: Vec<SyrupDetection>, window: &Window) -> Vec<SyrupDetection> {
             w,
             h,
             score: d.score,
+            value: d.value,
             n_keypoints: n as u32,
             keypoints,
             payload: d.payload,
@@ -450,6 +501,19 @@ pub fn generate(plan: &Plan, intent: &Intent, plan_hash: &str) -> String {
                 let _ = writeln!(
                     b,
                     "    let v{i} = find_color(host, &v{view}, matches_v{i}, {min_run}, {min_height}, {max_gap})?;"
+                );
+            }
+            Step::Whole { view } => {
+                helpers.insert(Helper::Whole);
+                let _ = writeln!(b, "    let v{i} = whole(&v{view});");
+            }
+            Step::Measure { boxes, view, what } => {
+                helpers.insert(Helper::Measure);
+                let m = what.abi();
+                let _ = writeln!(
+                    b,
+                    "    let v{i} = measure(host, &SyrupMeasure {{ kind: {}, hue_lo: {}, hue_hi: {}, min_saturation_pct: {}, min_value_pct: {} }}, &v{view}, v{boxes})?;",
+                    m.kind, m.hue_lo, m.hue_hi, m.min_saturation_pct, m.min_value_pct
                 );
             }
             Step::FilterAspect { boxes, min } => {

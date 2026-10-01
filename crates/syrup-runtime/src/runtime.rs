@@ -539,6 +539,7 @@ impl Operation {
             .min();
         // x + w can round a hair past the edge it was clipped to.
         let (w, h) = (image.width() as f32 + 1e-3, image.height() as f32 + 1e-3);
+        let measured = self.intent.measure.is_some();
         let inside = |d: &SyrupDetection| {
             let n = d.n_keypoints as usize;
             well_formed(d)
@@ -549,6 +550,7 @@ impl Operation {
                 && d.x + d.w <= w
                 && d.y + d.h <= h
                 && d.score >= min_confidence
+                && (!measured || (0.0..=1.0).contains(&d.value))
                 && d.payload as usize <= host.texts.len()
                 && d.keypoints[..2 * n]
                     .chunks(2)
@@ -592,6 +594,7 @@ impl Operation {
                     })
                     .collect(),
                 text: (d.payload > 0).then(|| host.texts[d.payload as usize - 1].clone()),
+                value: measured.then_some(d.value),
             })
             .collect();
         let manifest = &loaded.manifest;

@@ -129,6 +129,7 @@ struct Spec {
     limit: Option<u32>,
     min_area_pct: Option<u32>,
     max_area_pct: Option<u32>,
+    measure: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -140,7 +141,19 @@ enum RegionArg {
 
 fn intent_from(spec: Spec) -> Result<Intent, SyrupError> {
     let malformed = |reason: String| SyrupError::new(Stage::Resolve, ErrorKind::Malformed, reason);
-    let target = catalog::target_named(&spec.find).ok_or_else(|| {
+    let measure = match spec.measure {
+        None => None,
+        Some(word) => Some(
+            catalog::Quantity::named(&word)
+                .ok_or_else(|| malformed(format!("{word:?} is not a quantity Syrup measures")))?,
+        ),
+    };
+    // "image" names the searched image or region, which only measurements use.
+    let target = match spec.find.as_str() {
+        "image" if measure.is_some() => Some(catalog::Target::Image),
+        noun => catalog::target_named(noun),
+    }
+    .ok_or_else(|| {
         SyrupError::new(
             Stage::Resolve,
             ErrorKind::Unsupported,
@@ -184,6 +197,7 @@ fn intent_from(spec: Spec) -> Result<Intent, SyrupError> {
         limit: spec.limit,
         min_area_pct: spec.min_area_pct,
         max_area_pct: spec.max_area_pct,
+        measure,
     })
 }
 
@@ -245,6 +259,7 @@ impl Provider for PythonDetector {
                 w,
                 h,
                 score,
+                value: 0.0,
                 n_keypoints: 0,
                 keypoints: [0.0; 10],
                 payload: 0,

@@ -1,4 +1,4 @@
-// Syrup operation ABI v2. Included by the host and pasted verbatim into every
+// Syrup operation ABI v3. Included by the host and pasted verbatim into every
 // generated module, so both sides always agree. Bump SYRUP_ABI_VERSION when a
 // type's layout or a function's meaning changes; new capability ids are not
 // breaking, since hosts refuse ids they do not know.
@@ -6,7 +6,7 @@
 // Views are borrowed for one call. Detections returned by `detect` belong to
 // the host and stay valid only until the module's next call into the host.
 
-pub const SYRUP_ABI_VERSION: u32 = 2;
+pub const SYRUP_ABI_VERSION: u32 = 3;
 
 pub const SYRUP_OK: i32 = 0;
 pub const SYRUP_ERR_PROVIDER: i32 = 1;
@@ -17,6 +17,9 @@ pub const SYRUP_ERR_EMIT: i32 = 5;
 
 pub const SYRUP_CAP_FACE: u32 = 1;
 pub const SYRUP_CAP_TEXT: u32 = 2;
+
+pub const SYRUP_MEASURE_SHARPNESS: u32 = 1;
+pub const SYRUP_MEASURE_FILL: u32 = 2;
 
 pub const SYRUP_MAX_KEYPOINTS: usize = 5;
 
@@ -38,6 +41,8 @@ pub struct SyrupDetection {
     pub w: f32,
     pub h: f32,
     pub score: f32,
+    // Set by `measure`; meaningless before.
+    pub value: f32,
     pub n_keypoints: u32,
     pub keypoints: [f32; 2 * SYRUP_MAX_KEYPOINTS],
     // Opaque to modules, passed through untouched.
@@ -96,6 +101,29 @@ pub type SyrupGroupFn = unsafe extern "C" fn(
     out_len: *mut usize,
 ) -> i32;
 
+/// What to measure. Fill counts pixels of the hue range (degrees, wrapping
+/// when `hue_lo` is larger) with the given saturation and value.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SyrupMeasure {
+    pub kind: u32,
+    pub hue_lo: u32,
+    pub hue_hi: u32,
+    pub min_saturation_pct: u32,
+    pub min_value_pct: u32,
+}
+
+/// Writes one value per box (in `view`'s pixels) to `values`; NaN where the
+/// quantity cannot be measured.
+pub type SyrupMeasureFn = unsafe extern "C" fn(
+    ctx: *mut core::ffi::c_void,
+    what: *const SyrupMeasure,
+    view: *const SyrupImageView,
+    boxes: *const SyrupDetection,
+    n_boxes: usize,
+    values: *mut f32,
+) -> i32;
+
 pub type SyrupEmitFn =
     unsafe extern "C" fn(ctx: *mut core::ffi::c_void, detection: *const SyrupDetection) -> i32;
 
@@ -107,6 +135,7 @@ pub struct SyrupHost {
     pub detect: SyrupDetectFn,
     pub emit: SyrupEmitFn,
     pub group: SyrupGroupFn,
+    pub measure: SyrupMeasureFn,
 }
 
 pub type SyrupRunFn = unsafe extern "C" fn(

@@ -4,6 +4,10 @@
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+use syrup::color::is_color_pixel;
+use syrup::geometry::{Rect, measure_bar_fill};
+use syrup::quality::{Legibility, assess_text_quality};
+
 use crate::abi::*;
 use crate::catalog::Capability;
 use crate::contract::ImageInput;
@@ -44,6 +48,7 @@ impl<'a> ExecHost<'a> {
             detect: host_detect,
             emit: host_emit,
             group: host_group,
+            measure: host_measure,
         }
     }
 
@@ -116,6 +121,66 @@ impl<'a> ExecHost<'a> {
     }
 }
 
+/// The core's measurements, on the pixels of `view`.
+pub fn measure(
+    view: &ViewRef<'_>,
+    what: &SyrupMeasure,
+    boxes: &[SyrupDetection],
+) -> Result<Vec<f32>> {
+    let pixels = view.to_rgba();
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        w: view.width,
+        h: view.height,
+    };
+    let rect = |d: &SyrupDetection| {
+        let x0 = (d.x.floor().max(0.0) as u32).min(view.width);
+        let y0 = (d.y.floor().max(0.0) as u32).min(view.height);
+        let x1 = ((d.x + d.w).ceil().max(0.0) as u32).min(view.width);
+        let y1 = ((d.y + d.h).ceil().max(0.0) as u32).min(view.height);
+        Rect {
+            x: x0,
+            y: y0,
+            w: x1.saturating_sub(x0),
+            h: y1.saturating_sub(y0),
+        }
+    };
+    match what.kind {
+        SYRUP_MEASURE_SHARPNESS => Ok(boxes
+            .iter()
+            .map(|d| {
+                let quality = assess_text_quality(&pixels, rect(d));
+                match quality.legibility {
+                    Legibility::NoText => f32::NAN,
+                    _ => quality.sharpness,
+                }
+            })
+            .collect()),
+        SYRUP_MEASURE_FILL => {
+            let hue = (what.hue_lo as f32, what.hue_hi as f32);
+            let (sat, val) = (
+                what.min_saturation_pct as f32 / 100.0,
+                what.min_value_pct as f32 / 100.0,
+            );
+            Ok(boxes
+                .iter()
+                .map(|d| {
+                    measure_bar_fill(&pixels, rect(d), whole, |p| {
+                        is_color_pixel(p, hue, sat, val)
+                    })
+                    .map_or(f32::NAN, |pct| pct / 100.0)
+                })
+                .collect())
+        }
+        kind => Err(SyrupError::new(
+            Stage::Execute,
+            ErrorKind::ModuleFailed,
+            format!("the module asked for unknown measurement {kind}"),
+        )),
+    }
+}
+
 pub fn well_formed(d: &SyrupDetection) -> bool {
     [d.x, d.y, d.w, d.h]
         .iter()
@@ -155,6 +220,46 @@ unsafe extern "C" fn host_detect(
                 Stage::Execute,
                 ErrorKind::Panic,
                 "a provider panicked",
+            ));
+            SYRUP_ERR_PROVIDER
+        }
+    }
+}
+
+unsafe extern "C" fn host_measure(
+    ctx: *mut c_void,
+    what: *const SyrupMeasure,
+    view: *const SyrupImageView,
+    boxes: *const SyrupDetection,
+    n_boxes: usize,
+    values: *mut f32,
+) -> i32 {
+    // SAFETY: as in host_detect; `boxes` and `values` hold `n_boxes` items.
+    let host = unsafe { &mut *(ctx as *mut ExecHost) };
+    let (what, view) = unsafe { (&*what, &*view) };
+    let boxes = match n_boxes {
+        0 => &[][..],
+        n => unsafe { std::slice::from_raw_parts(boxes, n) },
+    };
+    let measured = catch_unwind(AssertUnwindSafe(|| {
+        host.view(view).and_then(|view| measure(&view, what, boxes))
+    }));
+    match measured {
+        Ok(Ok(measured)) => {
+            for (i, value) in measured.into_iter().enumerate() {
+                unsafe { *values.add(i) = value };
+            }
+            SYRUP_OK
+        }
+        Ok(Err(e)) => {
+            host.error = Some(e);
+            SYRUP_ERR_PROVIDER
+        }
+        Err(_) => {
+            host.error = Some(SyrupError::new(
+                Stage::Execute,
+                ErrorKind::Panic,
+                "a measurement panicked",
             ));
             SYRUP_ERR_PROVIDER
         }

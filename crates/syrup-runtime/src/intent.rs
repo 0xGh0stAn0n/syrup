@@ -7,7 +7,7 @@ use std::fmt;
 
 use serde::Serialize;
 
-use crate::catalog::{self, Color, Finder, Target};
+use crate::catalog::{self, Color, Finder, Quantity, Target};
 use crate::error::{ErrorKind, Result, Stage, SyrupError};
 
 /// An exact fraction. Regions use these so the interpreter and generated
@@ -204,6 +204,8 @@ pub struct Intent {
     /// Percent of the image area.
     pub min_area_pct: Option<u32>,
     pub max_area_pct: Option<u32>,
+    /// Set for `measure_*` operations: each item carries this quantity.
+    pub measure: Option<Quantity>,
 }
 
 impl Intent {
@@ -216,11 +218,48 @@ impl Intent {
             limit: None,
             min_area_pct: None,
             max_area_pct: None,
+            measure: None,
         }
     }
 
     pub fn check(&self) -> Result<()> {
         let entry = catalog::entry(self.target);
+        let error = |kind, reason: String| Err(SyrupError::new(Stage::Resolve, kind, reason));
+        match (self.measure, self.target) {
+            (None, Target::Image) => {
+                return error(
+                    ErrorKind::Malformed,
+                    "the whole image is only an item to measure".into(),
+                );
+            }
+            (Some(Quantity::Fill), Target::Image) => {
+                return error(
+                    ErrorKind::Ambiguous,
+                    "fill of what? e.g. measure_fill_of_red_bars".into(),
+                );
+            }
+            (Some(Quantity::Fill), target) if target != Target::Bar => {
+                return error(
+                    ErrorKind::Unsupported,
+                    format!("fill is measured on bars, not {}", entry.plural[0]),
+                );
+            }
+            (Some(q), Target::Image)
+                if self.order != OrderKey::ConfidenceDesc
+                    || self.limit.is_some()
+                    || self.min_area_pct.is_some()
+                    || self.max_area_pct.is_some() =>
+            {
+                return error(
+                    ErrorKind::Conflicting,
+                    format!(
+                        "{} of the image or a region is one value, with nothing to order or filter",
+                        q.name()
+                    ),
+                );
+            }
+            _ => {}
+        }
         match (entry.finder, self.color) {
             (Finder::Color { .. }, None) => {
                 return Err(SyrupError::new(
@@ -277,7 +316,10 @@ impl Intent {
 
 impl fmt::Display for Intent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("find ")?;
+        match self.measure {
+            Some(q) => write!(f, "measure {} of ", q.name())?,
+            None => f.write_str("find ")?,
+        }
         if let Some(color) = self.color {
             write!(f, "{} ", color.name())?;
         }
@@ -304,7 +346,6 @@ const FIND_VERBS: &[&str] = &["find", "detect", "locate"];
 const OTHER_VERBS: &[(&str, &str)] = &[
     ("count", "use len(find_...) for now"),
     ("read", "reading text is not in the catalog yet"),
-    ("measure", "measurements are not in the catalog yet"),
     ("track", "tracking needs state across frames"),
     (
         "recognize",
@@ -520,12 +561,18 @@ pub fn is_reserved(word: &str) -> bool {
         "all", "in", "by", "than", "to", "pct", "percent", "larger", "bigger", "smaller",
     ];
     FIND_VERBS.contains(&word)
+        || ["measure", "of"].contains(&word)
+        || Quantity::named(word).is_some()
         || OTHER_VERBS.iter().any(|(verb, _)| *verb == word)
         || SELECTORS.iter().any(|(words, _)| words.contains(&word))
         || KEYWORDS.contains(&word)
         || NUMBER_WORDS.contains(&word)
         || catalog::color_named(word).is_some()
         || word.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn quantity_names() -> String {
+    Quantity::ALL.map(Quantity::name).join("|")
 }
 
 pub fn grammar_summary() -> String {
@@ -535,9 +582,10 @@ pub fn grammar_summary() -> String {
          targets: {}; selectors: largest, smallest, leftmost, rightmost, topmost, bottommost, \
          most_confident; clauses: in_<region>, by_size, by_confidence, left_to_right, \
          right_to_left, top_to_bottom, bottom_to_top, larger_than_<n>pct, smaller_than_<n>pct; \
-         regions: {}, region",
+         regions: {}, region; measure_<{}>[_of_<what find takes>|_in_<region>]",
         catalog::known_targets(),
         regions.join(", "),
+        quantity_names(),
     )
 }
 
@@ -687,10 +735,6 @@ pub fn parse(name: &str) -> Result<Intent> {
         tokens: name.split('_').collect(),
         pos: 0,
     };
-    let malformed = |p: &Parser, reason: String| {
-        p.error(ErrorKind::Malformed, reason)
-            .with_hint(grammar_summary())
-    };
     if !well_formed {
         return Err(malformed(
             &p,
@@ -699,17 +743,58 @@ pub fn parse(name: &str) -> Result<Intent> {
     }
 
     let verb = p.peek();
-    if let Some((_, why)) = OTHER_VERBS.iter().find(|(v, _)| *v == verb) {
+    p.pos += 1;
+    let intent = if verb == "measure" {
+        measure(&mut p)?
+    } else if let Some((_, why)) = OTHER_VERBS.iter().find(|(v, _)| *v == verb) {
         return Err(p.error(
             ErrorKind::Unsupported,
             format!("{verb} is not supported: {why}"),
         ));
-    }
-    if !FIND_VERBS.contains(&verb) {
+    } else if FIND_VERBS.contains(&verb) {
+        find_body(&mut p)?
+    } else {
         return Err(malformed(&p, format!("{verb} is not a verb Syrup knows")));
-    }
-    p.pos += 1;
+    };
+    intent.check().map_err(|e| e.for_operation(name))?;
+    Ok(intent)
+}
 
+fn malformed(p: &Parser, reason: String) -> SyrupError {
+    p.error(ErrorKind::Malformed, reason)
+        .with_hint(grammar_summary())
+}
+
+/// `<quantity>[_of_<find body>|_in_<region>]`
+fn measure(p: &mut Parser) -> Result<Intent> {
+    let word = p.peek();
+    let Some(quantity) = Quantity::named(word) else {
+        let (kind, reason) = match word {
+            "" => (ErrorKind::Malformed, "measure what?".to_string()),
+            _ => (
+                ErrorKind::Unsupported,
+                format!("Syrup cannot measure {word}"),
+            ),
+        };
+        return Err(p
+            .error(kind, reason)
+            .with_hint(format!("quantities: {}", quantity_names())));
+    };
+    p.pos += 1;
+    let mut intent = if p.eat(&["of"]) {
+        find_body(p)?
+    } else {
+        let mut intent = Intent::find(Target::Image);
+        clauses(p, &mut intent)?;
+        intent
+    };
+    intent.measure = Some(quantity);
+    Ok(intent)
+}
+
+/// Everything after a find verb: the target with its count, selector and
+/// colour, then clauses.
+fn find_body(p: &mut Parser) -> Result<Intent> {
     let mut count = None;
     let mut selector: Option<(OrderKey, &str)> = None;
     let mut all = false;
@@ -720,7 +805,7 @@ pub fn parse(name: &str) -> Result<Intent> {
             break (target, plural);
         }
         if p.pos == p.tokens.len() {
-            return Err(malformed(&p, "the name has no target".into()));
+            return Err(malformed(p, "the name has no target".into()));
         }
         if let Some(n) = p.count()? {
             if count.replace(n).is_some() {
@@ -782,7 +867,51 @@ pub fn parse(name: &str) -> Result<Intent> {
 
     let mut intent = Intent::find(target);
     intent.color = color;
-    let mut order_clause: Option<&str> = None;
+    let order_clause = clauses(p, &mut intent)?;
+
+    match (selector, count) {
+        (Some((key, word)), count) => {
+            if all {
+                return Err(p.error(ErrorKind::Conflicting, format!("all contradicts {word}")));
+            }
+            if let Some(clause) = order_clause {
+                return Err(p.error(
+                    ErrorKind::Conflicting,
+                    format!("{word} already orders the results; {clause} contradicts it"),
+                ));
+            }
+            if plural && count.is_none() {
+                let entry = catalog::entry(target);
+                return Err(p
+                    .error(ErrorKind::Ambiguous, format!("how many {word} results?"))
+                    .with_hint(format!(
+                        "find_{word}_{} for one, find_3_{word}_{} for three",
+                        entry.singular[0], entry.plural[0]
+                    )));
+            }
+            intent.order = key;
+            intent.limit = Some(count.unwrap_or(1));
+        }
+        (None, Some(n)) => {
+            let plural = catalog::entry(target).plural[0];
+            return Err(p
+                .error(
+                    ErrorKind::Ambiguous,
+                    format!("{n} of which? A count needs an ordering"),
+                )
+                .with_hint(format!(
+                    "find_{n}_largest_{plural} or find_{n}_most_confident_{plural}"
+                )));
+        }
+        (None, None) => {}
+    }
+
+    Ok(intent)
+}
+
+/// Clauses after the target; returns the ordering clause, if any.
+fn clauses<'a>(p: &mut Parser<'a>, intent: &mut Intent) -> Result<Option<&'a str>> {
+    let mut order_clause: Option<&'a str> = None;
     while p.pos < p.tokens.len() {
         if p.eat(&["in"]) {
             if intent.region.is_some() {
@@ -833,51 +962,13 @@ pub fn parse(name: &str) -> Result<Intent> {
         } else {
             let rest = p.tokens[p.pos..].join("_");
             return Err(malformed(
-                &p,
+                p,
                 format!("{rest} is not a clause Syrup understands"),
             ));
         }
     }
 
-    match (selector, count) {
-        (Some((key, word)), count) => {
-            if all {
-                return Err(p.error(ErrorKind::Conflicting, format!("all contradicts {word}")));
-            }
-            if let Some(clause) = order_clause {
-                return Err(p.error(
-                    ErrorKind::Conflicting,
-                    format!("{word} already orders the results; {clause} contradicts it"),
-                ));
-            }
-            if plural && count.is_none() {
-                let entry = catalog::entry(target);
-                return Err(p
-                    .error(ErrorKind::Ambiguous, format!("how many {word} results?"))
-                    .with_hint(format!(
-                        "find_{word}_{} for one, find_3_{word}_{} for three",
-                        entry.singular[0], entry.plural[0]
-                    )));
-            }
-            intent.order = key;
-            intent.limit = Some(count.unwrap_or(1));
-        }
-        (None, Some(n)) => {
-            let plural = catalog::entry(target).plural[0];
-            return Err(p
-                .error(
-                    ErrorKind::Ambiguous,
-                    format!("{n} of which? A count needs an ordering"),
-                )
-                .with_hint(format!(
-                    "find_{n}_largest_{plural} or find_{n}_most_confident_{plural}"
-                )));
-        }
-        (None, None) => {}
-    }
-
-    intent.check().map_err(|e| e.for_operation(name))?;
-    Ok(intent)
+    Ok(order_clause)
 }
 
 #[cfg(test)]
@@ -1000,6 +1091,41 @@ mod tests {
                 ErrorKind::Malformed,
                 "{name:?}"
             );
+        }
+    }
+
+    #[test]
+    fn measurements_compose_with_what_find_takes() {
+        let sharpness = ok("measure_sharpness");
+        assert_eq!(
+            (sharpness.target, sharpness.measure),
+            (Target::Image, Some(Quantity::Sharpness))
+        );
+        assert!(ok("measure_sharpness_in_center").region.is_some());
+        let words = ok("measure_sharpness_of_words_left_to_right");
+        assert_eq!(
+            (words.target, words.order),
+            (Target::Word, OrderKey::LeftToRight)
+        );
+        let fill = ok("measure_fill_of_largest_red_bar_in_bottom_third");
+        assert_eq!(
+            (fill.target, fill.color, fill.limit, fill.measure),
+            (Target::Bar, Some(Color::Red), Some(1), Some(Quantity::Fill))
+        );
+        assert_ne!(ok("measure_sharpness_of_faces"), ok("find_faces"));
+
+        for (name, expected) in [
+            ("measure", ErrorKind::Malformed),
+            ("measure_weight", ErrorKind::Unsupported),
+            ("measure_fill", ErrorKind::Ambiguous),
+            ("measure_fill_of_faces", ErrorKind::Unsupported),
+            ("measure_fill_of_bars", ErrorKind::Ambiguous),
+            ("measure_sharpness_by_size", ErrorKind::Conflicting),
+            ("measure_sharpness_larger_than_5pct", ErrorKind::Conflicting),
+            ("measure_sharpness_of", ErrorKind::Malformed),
+            ("find_sharpness", ErrorKind::Unsupported),
+        ] {
+            assert_eq!(kind(name), expected, "{name}");
         }
     }
 
