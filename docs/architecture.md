@@ -85,5 +85,6 @@ from syrup.ops import find_face        Runtime::resolve("find_face")
    points stay as marked adapters.
 3. Measurements, sessions for motion and tracking, prepared bundles, wheels
    for Linux, macOS and Windows.
-4. Later: more providers, and an optional language-model planner that may
-   only emit typed plans.
+4. An optional language-model planner (`syrup.planner`) that may only emit
+   `define` specs from Syrup's vocabulary, checked like hand-written ones.
+5. Later: more providers.

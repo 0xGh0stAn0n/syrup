@@ -10,7 +10,15 @@ What every `find_*` operation honours, whichever name or language reached it.
 | `syrup.resolve("find_face")` | on the call | on first call, or `op.prepare()` |
 | `syrup.define("find_header_faces", ...)`, for names outside the grammar | on the call | on first call, or `op.prepare()` |
 | `syrup.add_target("qr_code", detect)` adds a noun found by a Python function; names then use it like any other | on later resolves | on first call |
+| `syrup.planner.plan("find_header_faces", "faces in the top fifth")` asks Claude for `define`'s arguments when the grammar does not cover a name | on the call | on first call |
 | Rust: `Runtime::resolve` / `Runtime::define` | on the call | on first `run`, or `prepare()` |
+
+The planner is optional (`pip install syrup-cv[planner]`). The model may
+only answer with values from Syrup's own vocabulary, which the request's
+JSON schema enumerates, or refuse as ambiguous or unsupported; it never
+writes code. Its answer is a `define` like any other and is checked the
+same way. Names the grammar resolves never reach it, and without a
+description neither do names it found ambiguous.
 
 Resolution never compiles, so a name Syrup cannot honour fails at import,
 before any image is involved. A name that was never imported or defined is

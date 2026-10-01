@@ -18,6 +18,7 @@ classifiers = [
 
 [project.optional-dependencies]
 test = ["pytest", "numpy", "pillow"]
+planner = ["anthropic"]
 
 [tool.maturin]
 manifest-path = "../crates/syrup-python/Cargo.toml"

@@ -12,7 +12,7 @@ use pyo3::types::PyBytes;
 use serde::Deserialize;
 use syrup_runtime::abi::SyrupDetection;
 use syrup_runtime::contract::ProviderInfo;
-use syrup_runtime::intent::region_named;
+use syrup_runtime::intent::{region_named, region_names};
 use syrup_runtime::providers::{Detections, Provider, ViewRef};
 use syrup_runtime::{
     ErrorKind, ImageInput, Intent, NormRect, Operation, OrderKey, OwnedImage, PixelRect, Ratio,
@@ -351,6 +351,26 @@ fn bundle(py: Python<'_>, path: PathBuf, names: Vec<String>) -> PyResult<String>
     Ok(serde_json::to_string(&index).expect("indexes serialize"))
 }
 
+/// The words `define` accepts, from the catalog as it is now, including
+/// targets added in this process.
+#[pyfunction]
+fn vocabulary() -> String {
+    let targets: Vec<&str> = catalog::all()
+        .into_iter()
+        .filter_map(|e| e.singular.first().copied())
+        .chain(["image"])
+        .collect();
+    serde_json::json!({
+        "targets": targets,
+        "colors": catalog::COLORS.iter().map(|c| c.names[0]).collect::<Vec<_>>(),
+        "regions": region_names(),
+        "orders": ["confidence", "size", "area_asc", "left_to_right", "right_to_left", "top_to_bottom", "bottom_to_top"],
+        "quantities": catalog::Quantity::ALL.map(catalog::Quantity::name),
+        "grammar": syrup_runtime::intent::grammar_summary(),
+    })
+    .to_string()
+}
+
 #[pyfunction]
 fn cache_dir() -> PyResult<PathBuf> {
     Ok(runtime()?.store().root().to_path_buf())
@@ -366,6 +386,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(add_target, m)?)?;
     m.add_function(wrap_pyfunction!(decode_image, m)?)?;
     m.add_function(wrap_pyfunction!(bundle, m)?)?;
+    m.add_function(wrap_pyfunction!(vocabulary, m)?)?;
     m.add_function(wrap_pyfunction!(cache_dir, m)?)?;
     Ok(())
 }

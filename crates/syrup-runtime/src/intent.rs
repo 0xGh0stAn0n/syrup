@@ -561,6 +561,15 @@ const NUMBER_WORDS: &[&str] = &[
     "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
 ];
 
+/// Canonical region names, `region` (the caller's) last.
+pub fn region_names() -> Vec<&'static str> {
+    NAMED_REGIONS
+        .iter()
+        .map(|(names, _)| names[0])
+        .chain(["region"])
+        .collect()
+}
+
 /// A region by its grammar name, e.g. `top_half` or `region`.
 pub fn region_named(name: &str) -> Option<RegionSpec> {
     if name == "region" {

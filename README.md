@@ -55,6 +55,16 @@ syrup.add_target("qr_code", my_qr_detector)   # e.g. OpenCV, a YOLO model, ...
 codes = syrup.ops.find_qr_codes_in_bottom_half_left_to_right("page.png")
 ```
 
+For names outside the grammar, `syrup.define` takes the meaning
+explicitly, and the optional planner asks Claude for it, constrained to
+Syrup's vocabulary and checked like any other definition:
+
+```python
+from syrup.planner import plan
+
+find_status_bar = plan("find_status_bar", "the big red bar along the bottom fifth")
+```
+
 The same mechanism is available from Rust (`syrup_runtime::Runtime`) and
 from the command line:
 
