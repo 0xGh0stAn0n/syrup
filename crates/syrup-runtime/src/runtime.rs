@@ -339,6 +339,12 @@ impl Operation {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(self.key.clone(), loaded.clone());
+        // Later callers find the module in `loaded` before reaching a gate.
+        inner
+            .building
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.key);
         Ok((loaded, status))
     }
 

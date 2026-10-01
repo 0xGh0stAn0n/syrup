@@ -77,16 +77,18 @@ impl Rustc {
                 .and_then(|release| release.split('.').nth(1))
                 .and_then(|minor| minor.parse::<u32>().ok());
             if minor.is_none_or(|minor| minor < MIN_MINOR) {
-                return Err(missing(format!(
-                    "{version} is too old; generated modules need rustc 1.{MIN_MINOR} or newer"
-                )));
+                tried.push(format!("{}: {version} is too old", path.display()));
+                continue;
             }
             return Ok(Rustc {
                 path: path.clone(),
                 version,
             });
         }
-        Err(missing("no Rust compiler found".into()).with_detail("tried", tried.join("; ")))
+        Err(
+            missing(format!("no Rust compiler 1.{MIN_MINOR} or newer found"))
+                .with_detail("tried", tried.join("; ")),
+        )
     }
 
     /// Writes rustc's output to `rustc.log` next to the source.

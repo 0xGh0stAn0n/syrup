@@ -121,6 +121,8 @@ pub fn well_formed(d: &SyrupDetection) -> bool {
         .iter()
         .chain(&d.keypoints)
         .all(|v| v.is_finite())
+        && d.w >= 0.0
+        && d.h >= 0.0
         && (0.0..=1.0).contains(&d.score)
         && d.n_keypoints as usize <= SYRUP_MAX_KEYPOINTS
 }

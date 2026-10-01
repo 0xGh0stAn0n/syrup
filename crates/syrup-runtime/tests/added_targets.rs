@@ -12,6 +12,21 @@ use syrup_runtime::{ErrorKind, ImageInput, RunParams, Runtime};
 /// Reports one 20x20 box at (10, 10) of whatever window it is shown.
 struct Corner;
 
+/// Reports a box with a negative width.
+struct Inverted;
+
+impl Provider for Inverted {
+    fn info(&self) -> ProviderInfo {
+        Corner.info()
+    }
+
+    fn detect(&self, view: &ViewRef<'_>) -> syrup_runtime::Result<Detections> {
+        let mut found = Corner.detect(view)?;
+        found.boxes[0].w = -20.0;
+        Ok(found)
+    }
+}
+
 impl Provider for Corner {
     fn info(&self) -> ProviderInfo {
         ProviderInfo {
@@ -73,4 +88,18 @@ fn added_nouns_cannot_take_over_the_grammar() {
         assert_eq!(e.kind, kind, "{singular}: {e}");
     }
     assert!(add_target("dot", "dots", 1.5, Arc::new(Corner)).is_err());
+}
+
+#[test]
+fn detections_with_negative_sizes_fail_the_run() {
+    add_target("flipped_dot", "flipped_dots", 0.5, Arc::new(Inverted)).unwrap();
+    let cache = TempDir::new();
+    let runtime = Runtime::new(config(&cache.0));
+    let pixels = vec![0u8; 100 * 100 * 3];
+    let image = ImageInput::new(&pixels, 100, 100, 3).unwrap();
+    let e = runtime
+        .resolve("find_flipped_dots")
+        .and_then(|op| op.run(&image, &RunParams::default()))
+        .unwrap_err();
+    assert_eq!(e.kind, ErrorKind::ProviderFailed, "{e}");
 }
