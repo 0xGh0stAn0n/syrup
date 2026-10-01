@@ -29,3 +29,25 @@ jobs:
         run: cargo test --workspace
       - name: Build
         run: cargo build --workspace --all-targets
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/syrup-python -> target
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Lint the extension
+        run: |
+          cargo fmt --manifest-path crates/syrup-python/Cargo.toml -- --check
+          cargo clippy --manifest-path crates/syrup-python/Cargo.toml -- -D warnings
+      - name: Install
+        run: pip install "./python[test]" opencv-python-headless
+      - name: Test
+        run: pytest python/tests
