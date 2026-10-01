@@ -81,6 +81,13 @@ impl ObjectTracker {
     /// this frame (center x, center y, width, height). Returns the current
     /// set of live tracks (both redetected and predicted-through-occlusion).
     pub fn update(&mut self, detections: &[(f32, f32, f32, f32)]) -> &[Track] {
+        self.assign(detections);
+        &self.tracks
+    }
+
+    /// Like [`ObjectTracker::update`], but returns the id of the track each
+    /// detection was matched to or opened, in detection order.
+    pub fn assign(&mut self, detections: &[(f32, f32, f32, f32)]) -> Vec<u64> {
         self.frame_index += 1;
         let mut used = vec![false; detections.len()];
         let mut matched_ids: HashMap<usize, usize> = HashMap::new();
@@ -109,9 +116,11 @@ impl ObjectTracker {
         }
 
         let frame_index = self.frame_index;
+        let mut ids = Vec::with_capacity(detections.len());
         for (det_idx, &(x, y, w, h)) in detections.iter().enumerate() {
             if let Some(&track_idx) = matched_ids.get(&det_idx) {
                 let track = &mut self.tracks[track_idx];
+                ids.push(track.id);
                 let new_position = Point { x, y };
                 track.velocity = Point {
                     x: new_position.x - track.position.x,
@@ -126,6 +135,7 @@ impl ObjectTracker {
                 // Stable, repeatedly redetected tracks become more trustworthy.
                 track.confidence = track.confidence.combine(Confidence::new(0.35)).decay(0.995);
             } else {
+                ids.push(self.next_id);
                 self.tracks.push(Track {
                     id: self.next_id,
                     position: Point { x, y },
@@ -160,7 +170,7 @@ impl ObjectTracker {
             true
         });
 
-        &self.tracks
+        ids
     }
 
     pub fn tracks(&self) -> &[Track] {
@@ -198,6 +208,15 @@ mod tests {
         assert!(tracker.tracks()[0].is_predicted());
         tracker.update(&[(11.0, 10.0, 4.0, 4.0)]);
         assert_eq!(tracker.tracks()[0].id, id);
+    }
+
+    #[test]
+    fn assign_reports_each_detection_s_track() {
+        let mut tracker = ObjectTracker::new(15.0, 3);
+        let first = tracker.assign(&[(10.0, 10.0, 4.0, 4.0), (50.0, 50.0, 4.0, 4.0)]);
+        // Same objects, listed in the other order and slightly moved.
+        let second = tracker.assign(&[(52.0, 51.0, 4.0, 4.0), (11.0, 10.0, 4.0, 4.0)]);
+        assert_eq!(second, vec![first[1], first[0]]);
     }
 
     #[test]

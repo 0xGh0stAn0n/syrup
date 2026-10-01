@@ -87,17 +87,15 @@ fn mock_detections(seed: u64, capability: u32, view: PixelRect) -> Vec<SyrupDete
     out
 }
 
-/// A value that depends only on the measurement and the box, rounded so
-/// float noise in the box cannot change it; one in five cannot be measured.
-fn mock_value(seed: u64, what: &SyrupMeasure, d: &SyrupDetection) -> f32 {
-    let q = |v: f32| (v * 16.0).round() as i64 as u64;
+/// A value for the `index`th box of the `call`th measurement. It depends on
+/// positions, not geometry, so float noise cannot change it; the geometry
+/// is compared separately. One in five cannot be measured.
+fn mock_value(seed: u64, what: &SyrupMeasure, call: usize, index: usize) -> f32 {
     let mut rng = SplitMix(
         seed ^ ((what.kind as u64) << 60)
             ^ ((what.hue_lo as u64) << 50)
-            ^ q(d.x).rotate_left(36)
-            ^ q(d.y).rotate_left(24)
-            ^ q(d.w).rotate_left(12)
-            ^ q(d.h),
+            ^ ((call as u64) << 32)
+            ^ index as u64,
     );
     if rng.below(5) == 0 {
         f32::NAN
@@ -252,9 +250,10 @@ unsafe extern "C" fn mock_measure(
     };
     match host.locate(unsafe { &*view }) {
         Ok(rect) => {
+            let call = host.measures.len();
             host.measures.push((what, rect, geometry(boxes)));
-            for (i, d) in boxes.iter().enumerate() {
-                unsafe { *values.add(i) = mock_value(host.seed, &what, d) };
+            for i in 0..boxes.len() {
+                unsafe { *values.add(i) = mock_value(host.seed, &what, call, i) };
             }
             SYRUP_OK
         }
@@ -296,10 +295,10 @@ impl Host for Oracle {
         boxes: &[SyrupDetection],
     ) -> Result<Vec<f32>> {
         let what = what.abi();
+        let call = self.measures.len();
         self.measures.push((what, view, geometry(boxes)));
-        Ok(boxes
-            .iter()
-            .map(|d| mock_value(self.seed, &what, d))
+        Ok((0..boxes.len())
+            .map(|i| mock_value(self.seed, &what, call, i))
             .collect())
     }
 }

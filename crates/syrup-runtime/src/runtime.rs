@@ -470,7 +470,8 @@ impl Operation {
             .with_hint("session = op.session(), then session(frame) for each frame")
             .for_operation(&self.name));
         }
-        self.run_inner(image, params, None)
+        self.run_inner(image, params, None, None)
+            .map(|(result, _)| result)
             .map_err(|e| e.for_operation(&self.name))
     }
 
@@ -499,17 +500,20 @@ impl Operation {
             op: self.clone(),
             tracker: ObjectTracker::new(options.max_distance, options.grace_frames),
             motion: Motion::new(motion),
-            region: None,
+            loaded: None,
             frames: 0,
         })
     }
 
+    /// Runs the module, loading it unless `loaded` is given; returns the
+    /// module too, so sessions can keep it.
     fn run_inner(
         &self,
         image: &ImageInput<'_>,
         params: &RunParams,
         motion: Option<&dyn Provider>,
-    ) -> Result<FindResult> {
+        loaded: Option<Arc<Loaded>>,
+    ) -> Result<(FindResult, Arc<Loaded>)> {
         let entry = catalog::entry(self.intent.target);
         let bad = |reason: String| {
             Err(SyrupError::new(
@@ -553,7 +557,10 @@ impl Operation {
         };
 
         let prepared_at = Instant::now();
-        let (loaded, status) = self.load_or_build()?;
+        let (loaded, status) = match loaded {
+            Some(loaded) => (loaded, ArtifactStatus::InMemory),
+            None => self.load_or_build()?,
+        };
         let prepare_ms = prepared_at.elapsed().as_secs_f64() * 1000.0;
 
         let abi_params = SyrupParams {
@@ -646,7 +653,7 @@ impl Operation {
             })
             .collect();
         let manifest = &loaded.manifest;
-        Ok(FindResult {
+        let result = FindResult {
             items,
             provenance: Provenance {
                 operation: self.name.clone(),
@@ -680,7 +687,8 @@ impl Operation {
                 execute_ms,
                 frame: None,
             },
-        })
+        };
+        Ok((result, loaded))
     }
 }
 
@@ -710,7 +718,7 @@ pub struct Session {
     op: Operation,
     tracker: ObjectTracker,
     motion: Motion,
-    region: Option<PixelRect>,
+    loaded: Option<Arc<Loaded>>,
     frames: u64,
 }
 
@@ -721,18 +729,16 @@ impl Session {
 
     /// Objects seen in this frame. Ids of objects missing for a few frames
     /// are kept, so they come back with the same id, but missing objects are
-    /// not reported.
+    /// not reported. A frame that fails leaves the session as it was.
     pub fn update(&mut self, image: &ImageInput<'_>, params: &RunParams) -> Result<FindResult> {
         let name = self.op.name.clone();
-        // Motion compares the same pixels from frame to frame.
-        if params.region != self.region {
-            self.motion.reset();
-            self.region = params.region;
-        }
-        let mut result = self
+        self.motion.begin(params.region);
+        let (mut result, loaded) = self
             .op
-            .run_inner(image, params, Some(&self.motion))
+            .run_inner(image, params, Some(&self.motion), self.loaded.clone())
             .map_err(|e| e.for_operation(&name))?;
+        self.loaded = Some(loaded);
+        self.motion.commit();
         self.frames += 1;
         let centres: Vec<(f32, f32, f32, f32)> = result
             .items
@@ -742,30 +748,15 @@ impl Session {
                 (b.x + b.w / 2.0, b.y + b.h / 2.0, b.w, b.h)
             })
             .collect();
-        let frame = self.tracker.frame_index() + 1;
-        let tracks = self.tracker.update(&centres);
-        let mut taken = vec![false; tracks.len()];
-        for (found, &(cx, cy, ..)) in result.items.iter_mut().zip(&centres) {
-            let at = (0..tracks.len())
-                .find(|&i| {
-                    let t = &tracks[i];
-                    !taken[i]
-                        && t.last_seen_frame == frame
-                        && t.position.x == cx
-                        && t.position.y == cy
-                })
-                .ok_or_else(|| {
-                    SyrupError::new(
-                        Stage::Execute,
-                        ErrorKind::ContractViolation,
-                        "the tracker lost a detection",
-                    )
-                    .for_operation(&name)
-                })?;
-            taken[at] = true;
-            let t = &tracks[at];
+        let ids = self.tracker.assign(&centres);
+        let tracks = self.tracker.tracks();
+        for (found, id) in result.items.iter_mut().zip(ids) {
+            let t = tracks
+                .iter()
+                .find(|t| t.id == id)
+                .expect("assign returns ids of live tracks");
             found.track = Some(TrackRef {
-                id: t.id,
+                id,
                 age_frames: t.age_frames,
                 velocity: (t.velocity.x, t.velocity.y),
             });

@@ -131,19 +131,13 @@ impl<'a> ExecHost<'a> {
     }
 }
 
-/// The core's measurements, on the pixels of `view`.
+/// The core's measurements, on the pixels of `view`; `boxes` are in its
+/// coordinates.
 pub fn measure(
     view: &ViewRef<'_>,
     what: &SyrupMeasure,
     boxes: &[SyrupDetection],
 ) -> Result<Vec<f32>> {
-    let pixels = view.to_rgba();
-    let whole = Rect {
-        x: 0,
-        y: 0,
-        w: view.width,
-        h: view.height,
-    };
     let rect = |d: &SyrupDetection| {
         let x0 = (d.x.floor().max(0.0) as u32).min(view.width);
         let y0 = (d.y.floor().max(0.0) as u32).min(view.height);
@@ -156,11 +150,24 @@ pub fn measure(
             h: y1.saturating_sub(y0),
         }
     };
+    let rects: Vec<Rect> = boxes.iter().map(rect).collect();
+    // Only the boxes' rows are read (fill searches along them, across the
+    // whole view), so only those are converted.
+    let top = rects.iter().map(|r| r.y).min().unwrap_or(0);
+    let bottom = rects.iter().map(|r| r.y + r.h).max().unwrap_or(0);
+    let pixels = view.rows_to_rgba(top, bottom.max(top));
+    let local = |r: &Rect| Rect { y: r.y - top, ..*r };
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        w: view.width,
+        h: bottom.saturating_sub(top),
+    };
     match what.kind {
-        SYRUP_MEASURE_SHARPNESS => Ok(boxes
+        SYRUP_MEASURE_SHARPNESS => Ok(rects
             .iter()
-            .map(|d| {
-                let quality = assess_text_quality(&pixels, rect(d));
+            .map(|r| {
+                let quality = assess_text_quality(&pixels, local(r));
                 match quality.legibility {
                     Legibility::NoText => f32::NAN,
                     _ => quality.sharpness,
@@ -173,10 +180,10 @@ pub fn measure(
                 what.min_saturation_pct as f32 / 100.0,
                 what.min_value_pct as f32 / 100.0,
             );
-            Ok(boxes
+            Ok(rects
                 .iter()
-                .map(|d| {
-                    measure_bar_fill(&pixels, rect(d), whole, |p| {
+                .map(|r| {
+                    measure_bar_fill(&pixels, local(r), whole, |p| {
                         is_color_pixel(p, hue, sat, val)
                     })
                     .map_or(f32::NAN, |pct| pct / 100.0)
@@ -202,6 +209,34 @@ pub fn well_formed(d: &SyrupDetection) -> bool {
         && d.n_keypoints as usize <= SYRUP_MAX_KEYPOINTS
 }
 
+/// Runs a host callback for the module: errors and panics become a status
+/// the module sees and an error the run reports. The first error wins.
+fn guarded(host: &mut ExecHost, what: &str, call: impl FnOnce(&mut ExecHost) -> Result<()>) -> i32 {
+    let error = match catch_unwind(AssertUnwindSafe(|| call(&mut *host))) {
+        Ok(Ok(())) => return SYRUP_OK,
+        Ok(Err(e)) => e,
+        Err(_) => SyrupError::new(Stage::Execute, ErrorKind::Panic, format!("{what} panicked")),
+    };
+    host.error.get_or_insert(error);
+    SYRUP_ERR_PROVIDER
+}
+
+/// `n` items at `ptr`, which may be null when `n` is 0.
+///
+/// # Safety
+/// When `n > 0`, `ptr` must point at `n` valid items for the call.
+unsafe fn items<'a, T>(ptr: *const T, n: usize) -> &'a [T] {
+    match n {
+        0 => &[],
+        // SAFETY: forwarded to the caller.
+        n => unsafe { std::slice::from_raw_parts(ptr, n) },
+    }
+}
+
+// SAFETY, for the callbacks below: `ctx` is the ExecHost that built the
+// table, and every pointer comes from the module, valid for the call as the
+// ABI requires.
+
 unsafe extern "C" fn host_detect(
     ctx: *mut c_void,
     capability: u32,
@@ -209,31 +244,16 @@ unsafe extern "C" fn host_detect(
     out_ptr: *mut *const SyrupDetection,
     out_len: *mut usize,
 ) -> i32 {
-    // SAFETY: ctx is the ExecHost that built this table; view and the out
-    // pointers come from the module and are valid per the ABI.
     let host = unsafe { &mut *(ctx as *mut ExecHost) };
     let view = unsafe { &*view };
-    match catch_unwind(AssertUnwindSafe(|| host.detect(capability, view))) {
-        Ok(Ok(())) => {
-            unsafe {
-                *out_ptr = host.scratch.as_ptr();
-                *out_len = host.scratch.len();
-            }
-            SYRUP_OK
-        }
-        Ok(Err(e)) => {
-            host.error = Some(e);
-            SYRUP_ERR_PROVIDER
-        }
-        Err(_) => {
-            host.error = Some(SyrupError::new(
-                Stage::Execute,
-                ErrorKind::Panic,
-                "a provider panicked",
-            ));
-            SYRUP_ERR_PROVIDER
+    let status = guarded(host, "a provider", |host| host.detect(capability, view));
+    if status == SYRUP_OK {
+        unsafe {
+            *out_ptr = host.scratch.as_ptr();
+            *out_len = host.scratch.len();
         }
     }
+    status
 }
 
 unsafe extern "C" fn host_measure(
@@ -244,40 +264,18 @@ unsafe extern "C" fn host_measure(
     n_boxes: usize,
     values: *mut f32,
 ) -> i32 {
-    // SAFETY: as in host_detect; `boxes` and `values` hold `n_boxes` items.
     let host = unsafe { &mut *(ctx as *mut ExecHost) };
-    let (what, view) = unsafe { (&*what, &*view) };
-    let boxes = match n_boxes {
-        0 => &[][..],
-        n => unsafe { std::slice::from_raw_parts(boxes, n) },
-    };
-    let measured = catch_unwind(AssertUnwindSafe(|| {
-        host.view(view).and_then(|view| measure(&view, what, boxes))
-    }));
-    match measured {
-        Ok(Ok(measured)) => {
-            for (i, value) in measured.into_iter().enumerate() {
-                unsafe { *values.add(i) = value };
-            }
-            SYRUP_OK
+    let (what, view, boxes) = unsafe { (&*what, &*view, items(boxes, n_boxes)) };
+    guarded(host, "a measurement", |host| {
+        let measured = measure(&host.view(view)?, what, boxes)?;
+        for (i, value) in measured.into_iter().enumerate() {
+            unsafe { *values.add(i) = value };
         }
-        Ok(Err(e)) => {
-            host.error = Some(e);
-            SYRUP_ERR_PROVIDER
-        }
-        Err(_) => {
-            host.error = Some(SyrupError::new(
-                Stage::Execute,
-                ErrorKind::Panic,
-                "a measurement panicked",
-            ));
-            SYRUP_ERR_PROVIDER
-        }
-    }
+        Ok(())
+    })
 }
 
 unsafe extern "C" fn host_emit(ctx: *mut c_void, detection: *const SyrupDetection) -> i32 {
-    // SAFETY: as in host_detect.
     unsafe { (*(ctx as *mut ExecHost)).out.push(*detection) };
     SYRUP_OK
 }
@@ -291,28 +289,17 @@ unsafe extern "C" fn host_group(
     out_ptr: *mut *const SyrupRect,
     out_len: *mut usize,
 ) -> i32 {
-    // SAFETY: as in host_detect; `runs` holds `n_runs` runs for the call.
     let host = unsafe { &mut *(ctx as *mut ExecHost) };
-    let runs = match n_runs {
-        0 => &[][..],
-        n => unsafe { std::slice::from_raw_parts(runs, n) },
-    };
-    match catch_unwind(AssertUnwindSafe(|| group_runs(runs, min_height, max_gap))) {
-        Ok(rects) => {
-            host.rects = rects;
-            unsafe {
-                *out_ptr = host.rects.as_ptr();
-                *out_len = host.rects.len();
-            }
-            SYRUP_OK
-        }
-        Err(_) => {
-            host.error = Some(SyrupError::new(
-                Stage::Execute,
-                ErrorKind::Panic,
-                "region grouping panicked",
-            ));
-            SYRUP_ERR_PROVIDER
+    let runs = unsafe { items(runs, n_runs) };
+    let status = guarded(host, "region grouping", |host| {
+        host.rects = group_runs(runs, min_height, max_gap);
+        Ok(())
+    });
+    if status == SYRUP_OK {
+        unsafe {
+            *out_ptr = host.rects.as_ptr();
+            *out_len = host.rects.len();
         }
     }
+    status
 }

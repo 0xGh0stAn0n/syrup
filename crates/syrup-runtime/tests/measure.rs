@@ -110,3 +110,30 @@ fn sharpness_tells_crisp_text_from_blurred() {
     let half = run(&runtime, "measure_sharpness_in_left_half", &crisp).items;
     assert_eq!(half[0].bbox.w, (crisp.width() as f32 / 2.0).round());
 }
+
+#[test]
+fn fill_is_measured_within_the_searched_region() {
+    let cache = TempDir::new();
+    let runtime = Runtime::new(config(&cache.0));
+    // A track across the whole width, red for its first 100 columns.
+    let mut image = RgbaImage::from_pixel(400, 100, Rgba([28, 30, 34, 255]));
+    for y in 50..60 {
+        for x in 20..380 {
+            let pixel = if x < 120 {
+                Rgba([210, 40, 40, 255])
+            } else {
+                Rgba([70, 70, 78, 255])
+            };
+            image.put_pixel(x, y, pixel);
+        }
+    }
+    let whole = run(&runtime, "measure_fill_of_red_bars", &image).items[0]
+        .value
+        .unwrap();
+    let left = run(&runtime, "measure_fill_of_red_bars_in_left_half", &image).items[0]
+        .value
+        .unwrap();
+    // 100 of 360 track columns in the image; 100 of the 180 in its left half.
+    assert!((whole - 100.0 / 360.0).abs() < 0.02, "{whole}");
+    assert!((left - 100.0 / 180.0).abs() < 0.02, "{left}");
+}

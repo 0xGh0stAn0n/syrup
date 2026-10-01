@@ -109,3 +109,40 @@ fn tracking_needs_a_session_and_sessions_need_tracking() {
         "per frame, track_faces is find_faces"
     );
 }
+
+#[test]
+fn a_failed_frame_leaves_the_session_as_it_was() {
+    let cache = TempDir::new();
+    let runtime = Runtime::new(config(&cache.0));
+    let mut session = runtime
+        .resolve("track_moving_regions_in_region")
+        .unwrap()
+        .session(SessionOptions::default())
+        .unwrap();
+    let region = |x, y| RunParams {
+        region: Some(syrup_runtime::PixelRect {
+            x,
+            y,
+            w: 200,
+            h: 120,
+        }),
+        ..RunParams::default()
+    };
+    let first = square_at(10);
+    session
+        .update(&ImageInput::from_rgba(&first), &region(0, 0))
+        .unwrap();
+    // A region outside the image fails the frame...
+    assert!(
+        session
+            .update(&ImageInput::from_rgba(&first), &region(500, 0))
+            .is_err()
+    );
+    // ...and the next good frame still compares with the first one.
+    let moved = square_at(40);
+    let result = session
+        .update(&ImageInput::from_rgba(&moved), &region(0, 0))
+        .unwrap();
+    assert_eq!(result.items.len(), 2);
+    assert_eq!(result.provenance.frame, Some(2));
+}

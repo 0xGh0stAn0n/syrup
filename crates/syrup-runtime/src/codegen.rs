@@ -323,10 +323,19 @@ fn measure(
     if boxes.is_empty() {
         return Ok(boxes);
     }
+    // The host measures in the window's pixels.
+    let local: Vec<SyrupDetection> = boxes
+        .iter()
+        .map(|d| SyrupDetection {
+            x: d.x - window.x as f32,
+            y: d.y - window.y as f32,
+            ..*d
+        })
+        .collect();
     let mut values = vec![f32::NAN; boxes.len()];
     // SAFETY: the host reads the boxes and writes one value per box during the call.
     let status = unsafe {
-        (host.measure)(host.ctx, what, &window.view, boxes.as_ptr(), boxes.len(), values.as_mut_ptr())
+        (host.measure)(host.ctx, what, &window.view, local.as_ptr(), local.len(), values.as_mut_ptr())
     };
     if status != SYRUP_OK {
         return Err(status);
@@ -670,6 +679,10 @@ mod tests {
             "find_face",
             "find_2_largest_faces_in_top_half_larger_than_2pct",
             "find_faces_in_region_left_to_right",
+            "measure_fill_of_red_bars_in_bottom_third",
+            "measure_sharpness_of_words_in_region",
+            "measure_sharpness",
+            "track_qr_codes",
         ] {
             check_policy(&source(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
         }

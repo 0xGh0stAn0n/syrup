@@ -225,7 +225,15 @@ pub fn run(
                 let rect = view(&values, at)?;
                 let mut kept = take(&mut values, boxes)?;
                 if !kept.is_empty() {
-                    let measured = host.measure(what, rect, &kept)?;
+                    let local: Vec<SyrupDetection> = kept
+                        .iter()
+                        .map(|d| SyrupDetection {
+                            x: d.x - rect.x as f32,
+                            y: d.y - rect.y as f32,
+                            ..*d
+                        })
+                        .collect();
+                    let measured = host.measure(what, rect, &local)?;
                     if measured.len() != kept.len() {
                         return Err(invalid("the host measured a different number of boxes"));
                     }

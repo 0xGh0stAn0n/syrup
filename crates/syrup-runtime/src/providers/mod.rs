@@ -41,14 +41,30 @@ impl ViewRef<'_> {
     }
 
     pub fn to_rgba(&self) -> image::RgbaImage {
-        image::RgbaImage::from_fn(self.width, self.height, |x, y| {
-            let p = self.pixel(x, y);
-            image::Rgba(match p.len() {
-                1 => [p[0], p[0], p[0], 255],
-                3 => [p[0], p[1], p[2], 255],
-                _ => [p[0], p[1], p[2], p[3]],
-            })
-        })
+        self.rows_to_rgba(0, self.height)
+    }
+
+    /// Rows `top..bottom` as RGBA.
+    pub fn rows_to_rgba(&self, top: u32, bottom: u32) -> image::RgbaImage {
+        let (width, c) = (self.width as usize, self.channels as usize);
+        let mut out = Vec::with_capacity(width * (bottom - top) as usize * 4);
+        for y in top..bottom {
+            let row = &self.data[y as usize * self.stride..][..width * c];
+            match c {
+                4 => out.extend_from_slice(row),
+                3 => {
+                    for &[r, g, b] in row.as_chunks::<3>().0 {
+                        out.extend_from_slice(&[r, g, b, 255]);
+                    }
+                }
+                _ => {
+                    for &v in row {
+                        out.extend_from_slice(&[v, v, v, 255]);
+                    }
+                }
+            }
+        }
+        image::RgbaImage::from_raw(self.width, bottom - top, out).expect("sized to fit")
     }
 
     pub fn to_rgb(&self) -> image::RgbImage {

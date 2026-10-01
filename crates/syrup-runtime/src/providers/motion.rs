@@ -11,23 +11,49 @@ use crate::abi::{SYRUP_MAX_KEYPOINTS, SyrupDetection};
 use crate::catalog::Capability;
 use crate::contract::ProviderInfo;
 use crate::error::Result;
+use crate::intent::PixelRect;
 
 pub struct Motion {
     config: MotionConfig,
-    previous: Mutex<Option<RgbaImage>>,
+    state: Mutex<State>,
+}
+
+#[derive(Default)]
+struct State {
+    /// The region this frame searches, set by `begin`.
+    region: Option<PixelRect>,
+    /// The last committed frame's pixels, and the region they came from.
+    previous: Option<(Option<PixelRect>, RgbaImage)>,
+    /// This frame's pixels, kept once `commit` says the frame succeeded.
+    pending: Option<RgbaImage>,
 }
 
 impl Motion {
     pub fn new(config: MotionConfig) -> Motion {
         Motion {
             config,
-            previous: Mutex::new(None),
+            state: Mutex::default(),
         }
     }
 
-    /// Forgets the previous frame, e.g. when the searched region moves.
-    pub fn reset(&self) {
-        *self.previous.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    fn state(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Starts a frame. Motion is only measured against a previous frame
+    /// that searched the same region.
+    pub fn begin(&self, region: Option<PixelRect>) {
+        let mut state = self.state();
+        state.region = region;
+        state.pending = None;
+    }
+
+    /// The frame succeeded: it becomes the one the next frame is compared with.
+    pub fn commit(&self) {
+        let mut state = self.state();
+        if let Some(pixels) = state.pending.take() {
+            state.previous = Some((state.region, pixels));
+        }
     }
 }
 
@@ -41,15 +67,18 @@ impl Provider for Motion {
         }
     }
 
-    /// Nothing moves in the first frame, or in a frame whose size differs
-    /// from the one before.
+    /// Nothing moves in the first frame, in a frame whose size differs from
+    /// the one before, or after the searched region changed.
     fn detect(&self, view: &ViewRef<'_>) -> Result<Detections> {
         let current = view.to_rgba();
-        let mut previous = self.previous.lock().unwrap_or_else(|e| e.into_inner());
-        let mask = previous
-            .as_ref()
-            .and_then(|before| motion_mask(before, &current, self.config.diff_threshold));
-        *previous = Some(current);
+        let mut state = self.state();
+        let mask = match &state.previous {
+            Some((region, before)) if *region == state.region => {
+                motion_mask(before, &current, self.config.diff_threshold)
+            }
+            _ => None,
+        };
+        state.pending = Some(current);
         let Some(mask) = mask else {
             return Ok(Detections::default());
         };

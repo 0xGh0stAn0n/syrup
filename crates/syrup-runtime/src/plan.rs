@@ -120,7 +120,8 @@ pub enum Step {
         boxes: usize,
     },
     /// Sets each box's value; boxes the host cannot measure are dropped.
-    /// `view` is the input, which the restored boxes are in.
+    /// The boxes are in input space; the host measures them within `view`,
+    /// the searched region, so a fill is never read from outside it.
     Measure {
         boxes: usize,
         view: usize,
@@ -246,11 +247,7 @@ impl Plan {
                 },
                 (Quantity::Fill, None) => return Err(invalid("fill needs the bar's colour")),
             };
-            boxes = push(Step::Measure {
-                boxes,
-                view: 0,
-                what,
-            });
+            boxes = push(Step::Measure { boxes, view, what });
         }
         push(Step::Emit { boxes });
 
@@ -345,9 +342,10 @@ impl Plan {
                     return Err(invalid(format!("step {i}: fill thresholds out of range")));
                 }
                 Step::Measure { boxes, view, .. } => {
-                    if types[view] != ValueType::View(Space::Input) {
+                    if !matches!(types[view], ValueType::View(_)) {
                         return Err(invalid(format!(
-                            "step {i} measures against something other than the input"
+                            "step {i} measures within {:?}",
+                            types[view]
                         )));
                     }
                     restored(boxes)?
