@@ -24,4 +24,4 @@ syrup.bundle("ops-bundle", "find_largest_face", "find_words")
 
 Detectors from other libraries plug in with `syrup.add_target`. The grammar,
 result contract and failure classes are in
-[docs/contract.md](https://github.com/scp-labs/C4/blob/main/docs/contract.md).
+[docs/contract.md](https://github.com/0xGh0stAn0n/syrup/blob/main/docs/contract.md).

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "A small toolkit for turning captured frames into structured, confidence-scored visual observations"
-repository = "https://github.com/boggioMichael/syrup"
+repository = "https://github.com/0xGh0stAn0n/syrup"
 keywords = ["computer-vision", "screen-capture", "ocr", "detection"]
 categories = ["computer-vision", "multimedia::images"]
 

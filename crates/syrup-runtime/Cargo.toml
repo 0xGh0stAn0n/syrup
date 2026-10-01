@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.91"
 license = "MIT"
 description = "Turns named computer-vision intents into validated, compiled, dynamically loaded native operations"
-repository = "https://github.com/boggioMichael/syrup"
+repository = "https://github.com/0xGh0stAn0n/syrup"
 keywords = ["computer-vision", "detection", "codegen", "jit", "face-detection"]
 categories = ["computer-vision", "multimedia::images"]
 
