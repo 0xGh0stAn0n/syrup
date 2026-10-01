@@ -29,6 +29,13 @@ cached, and loaded. Later calls and later processes reuse the compiled
 module. Names Syrup cannot honour fail at import with a reason:
 `find_best_face` is refused because "best" does not say by what.
 
+Detectors from any Python library become nouns the same way:
+
+```python
+syrup.add_target("qr_code", my_qr_detector)   # e.g. OpenCV, a YOLO model, ...
+codes = syrup.ops.find_qr_codes_in_bottom_half_left_to_right("page.png")
+```
+
 The same mechanism is available from Rust (`syrup_runtime::Runtime`) and
 from the command line:
 

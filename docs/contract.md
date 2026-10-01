@@ -9,6 +9,7 @@ What every `find_*` operation honours, whichever name or language reached it.
 | `from syrup.ops import find_face` / `syrup.ops.find_face` (PEP 562 module `__getattr__`) | on import or attribute access | on first call, or `op.prepare()` |
 | `syrup.resolve("find_face")` | on the call | on first call, or `op.prepare()` |
 | `syrup.define("find_header_faces", ...)`, for names outside the grammar | on the call | on first call, or `op.prepare()` |
+| `syrup.add_target("qr_code", detect)` adds a noun found by a Python function; names then use it like any other | on later resolves | on first call |
 | Rust: `Runtime::resolve` / `Runtime::define` | on the call | on first `run`, or `prepare()` |
 
 Resolution never compiles, so a name Syrup cannot honour fails at import,
@@ -33,7 +34,12 @@ region    := top_half | bottom_half | left_half | right_half
            | top_third | bottom_third | left_third | right_third | center | region
 ```
 
-Faces come from YuNet, words from Tesseract. Regions and bars need a
+Faces come from YuNet, words from Tesseract, and nouns added with
+`add_target` from their own detector, which receives the searched pixels
+and returns `(x, y, w, h, score[, text])` boxes in them; the compiled
+module does the rest. Added nouns may not use words the grammar already
+gives a meaning (verbs, selectors, colours, `in`, `by`, numbers, ...) or
+existing nouns, so adding one never changes what an existing name means. Regions and bars need a
 colour and are found by the generated module itself: pixels whose hue falls
 in the colour's range (saturation ≥ 35%, value ≥ 30%, alpha ≥ 50%), in
 horizontal runs of at least 3 pixels, grouped by the core's region grouping
