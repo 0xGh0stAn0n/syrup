@@ -1,5 +1,6 @@
 """A detector from another library becomes a Syrup target: OpenCV's QR
-code reader here, but it could be any model with a Python API."""
+code reader, as the noun "tag", here; it could be any model with a Python
+API. (QR codes themselves are built in, as qr_code.)"""
 
 import numpy as np
 import pytest
@@ -27,25 +28,25 @@ def page():
 
 
 @pytest.fixture(scope="module", autouse=True)
-def qr_target():
-    syrup.add_target("qr_code", qr_codes, min_confidence=0.0)
+def tag_target():
+    syrup.add_target("tag", qr_codes, min_confidence=0.0)
 
 
 def test_operations_compose_around_a_python_detector():
     image = page()
-    found = syrup.ops.find_qr_codes_left_to_right(image)
+    found = syrup.ops.find_tags_left_to_right(image)
     assert [f.text for f in found] == ["left", "top", "right"]
-    assert found.provenance.providers == [{"capability": "qr_code", "name": "python", "model_sha256": None, "runtime": "python"}]
+    assert found.provenance.providers == [{"capability": "tag", "name": "python", "model_sha256": None, "runtime": "python"}]
 
-    lower = syrup.ops.find_qr_codes_in_bottom_half_left_to_right(image)
+    lower = syrup.ops.find_tags_in_bottom_half_left_to_right(image)
     assert [f.text for f in lower] == ["left", "right"]
     # The detector saw only the bottom half; the box is back in page pixels.
     left = lower[0].box
     assert 40 <= left.x < 60 and 300 <= left.y < 320, left
 
-    (rightmost,) = syrup.ops.find_rightmost_qr_code(image)
+    (rightmost,) = syrup.ops.find_rightmost_tag(image)
     assert rightmost.text == "right"
-    assert not syrup.ops.find_qr_codes(np.full((100, 100, 3), 255, np.uint8))
+    assert not syrup.ops.find_tags(np.full((100, 100, 3), 255, np.uint8))
 
 
 def test_added_nouns_must_not_change_what_names_mean():
@@ -54,6 +55,8 @@ def test_added_nouns_must_not_change_what_names_mean():
     assert e.value.kind == "conflicting"
     with pytest.raises(syrup.IntentError):
         syrup.add_target("face", qr_codes)
+    with pytest.raises(syrup.IntentError):
+        syrup.add_target("qr_code", qr_codes)
     with pytest.raises(syrup.IntentError):
         syrup.ops.find_widgets
 

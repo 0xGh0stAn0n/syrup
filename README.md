@@ -51,8 +51,8 @@ for frame in frames:
 Detectors from any Python library become nouns the same way:
 
 ```python
-syrup.add_target("qr_code", my_qr_detector)   # e.g. OpenCV, a YOLO model, ...
-codes = syrup.ops.find_qr_codes_in_bottom_half_left_to_right("page.png")
+syrup.add_target("licence_plate", my_plate_detector)   # e.g. a YOLO model, OpenCV, ...
+plates = syrup.ops.find_licence_plates_in_bottom_half_left_to_right("street.jpg")
 ```
 
 For names outside the grammar, `syrup.define` takes the meaning

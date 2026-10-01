@@ -9,7 +9,7 @@ What every `find_*` operation honours, whichever name or language reached it.
 | `from syrup.ops import find_face` / `syrup.ops.find_face` (PEP 562 module `__getattr__`) | on import or attribute access | on first call, or `op.prepare()` |
 | `syrup.resolve("find_face")` | on the call | on first call, or `op.prepare()` |
 | `syrup.define("find_header_faces", ...)`, for names outside the grammar | on the call | on first call, or `op.prepare()` |
-| `syrup.add_target("qr_code", detect)` adds a noun found by a Python function; names then use it like any other | on later resolves | on first call |
+| `syrup.add_target("licence_plate", detect)` adds a noun found by a Python function; names then use it like any other | on later resolves | on first call |
 | `syrup.planner.plan("find_header_faces", "faces in the top fifth")` asks Claude for `define`'s arguments when the grammar does not cover a name | on the call | on first call |
 | Rust: `Runtime::resolve` / `Runtime::define` | on the call | on first `run`, or `prepare()` |
 
@@ -36,6 +36,7 @@ quantity  := sharpness | fill
 verb      := find | detect | locate
 target    := face | faces | human_face | human_faces | word | words
            | region | regions | blob | blobs | bar | bars
+           | qr_code | qr_codes
            | moving_region | moving_regions | moving_blob | moving_blobs
 colour    := red | orange | yellow | green | cyan | blue | purple | violet | magenta
 selector  := largest | biggest | smallest | leftmost | rightmost | topmost | bottommost | most_confident
@@ -48,7 +49,11 @@ region    := top_half | bottom_half | left_half | right_half
            | top_third | bottom_third | left_third | right_third | center | region
 ```
 
-Faces come from YuNet, words from Tesseract, and nouns added with
+Faces come from YuNet, words from Tesseract, QR codes from rqrr (decoded
+codes score 1, codes found but unreadable 0.5, below the default 0.6;
+`text` is the content and the keypoints are the corners `top_left`,
+`top_right`, `bottom_right`, `bottom_left` in the code's own orientation),
+and nouns added with
 `add_target` from their own detector, which receives the searched pixels
 and returns `(x, y, w, h, score[, text])` boxes in them; the compiled
 module does the rest. Added nouns may not use words the grammar already
@@ -175,7 +180,7 @@ Per-call parameters never trigger a rebuild:
 
 | | default | |
 |---|---|---|
-| `min_confidence` | faces 0.6, words 0.5, regions and bars 0 | in `[0, 1]`; the face provider never reports below 0.1 |
+| `min_confidence` | faces 0.6, words 0.5, QR codes 0.6, regions, bars and moving regions 0, added targets as added (0.5 by default) | in `[0, 1]`; the face provider never reports below 0.1 |
 | `max_results` | none | ≥ 1, applied after the operation's own limit |
 | `region` | | required by `_in_region` operations, refused by all others |
 

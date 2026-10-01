@@ -27,6 +27,7 @@ pub enum Target {
     Bar,
     /// What changed since the previous frame; only sessions see frames.
     MovingRegion,
+    QrCode,
     /// The searched image or region as one item; only measurements use it.
     Image,
     Custom(Name),
@@ -65,6 +66,7 @@ pub enum Capability {
     FaceDetection,
     TextRecognition,
     Motion,
+    QrDecoding,
     Custom(Name),
 }
 
@@ -76,6 +78,7 @@ impl Capability {
             Capability::FaceDetection => abi::SYRUP_CAP_FACE,
             Capability::TextRecognition => abi::SYRUP_CAP_TEXT,
             Capability::Motion => abi::SYRUP_CAP_MOTION,
+            Capability::QrDecoding => abi::SYRUP_CAP_QR,
             Capability::Custom(name) => custom_id(name.as_str()),
         }
     }
@@ -85,6 +88,7 @@ impl Capability {
             abi::SYRUP_CAP_FACE => Some(Capability::FaceDetection),
             abi::SYRUP_CAP_TEXT => Some(Capability::TextRecognition),
             abi::SYRUP_CAP_MOTION => Some(Capability::Motion),
+            abi::SYRUP_CAP_QR => Some(Capability::QrDecoding),
             id => custom::entries().into_iter().find_map(|e| match e.finder {
                 Finder::Detect(c @ Capability::Custom(_)) if c.abi_id() == id => Some(c),
                 _ => None,
@@ -97,6 +101,7 @@ impl Capability {
             Capability::FaceDetection => "face_detection",
             Capability::TextRecognition => "text_recognition",
             Capability::Motion => "motion",
+            Capability::QrDecoding => "qr_decoding",
             Capability::Custom(name) => name.as_str(),
         }
     }
@@ -284,6 +289,18 @@ pub const TARGETS: &[TargetEntry] = &[
         default_min_confidence: 0.0,
         keypoints: &[],
         description: "bars of one colour, at least 3 times wider than tall, e.g. red_bars",
+    },
+    TargetEntry {
+        target: Target::QrCode,
+        label: "qr_code",
+        singular: &["qr_code"],
+        plural: &["qr_codes"],
+        finder: Finder::Detect(Capability::QrDecoding),
+        // Decoded codes score 1; unreadable ones 0.5.
+        default_min_confidence: 0.6,
+        // rqrr's order, in the code's own orientation.
+        keypoints: &["top_left", "top_right", "bottom_right", "bottom_left"],
+        description: "QR codes, with what they say",
     },
     TargetEntry {
         target: Target::MovingRegion,

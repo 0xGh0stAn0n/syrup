@@ -1,6 +1,7 @@
 //! Capabilities the host offers generated modules.
 
 pub mod motion;
+pub mod qr;
 pub mod tesseract;
 #[cfg(feature = "face-yunet")]
 pub mod yunet;
@@ -85,6 +86,7 @@ pub enum ModelSource {
 pub struct Providers {
     face: Arc<dyn Provider>,
     text: Arc<dyn Provider>,
+    qr: Arc<dyn Provider>,
 }
 
 impl Providers {
@@ -99,6 +101,7 @@ impl Providers {
         Providers {
             face,
             text: Arc::new(tesseract::Tesseract),
+            qr: Arc::new(qr::Qr),
         }
     }
 
@@ -106,6 +109,7 @@ impl Providers {
         match capability {
             Capability::FaceDetection => Ok(self.face.clone()),
             Capability::TextRecognition => Ok(self.text.clone()),
+            Capability::QrDecoding => Ok(self.qr.clone()),
             Capability::Motion => Err(SyrupError::new(
                 Stage::Execute,
                 ErrorKind::BadParameter,
