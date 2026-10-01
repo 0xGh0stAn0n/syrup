@@ -134,10 +134,17 @@ sessions (`find_moving_regions` is refused), and changing the session's
 as it was.
 
 Frames can come from a source instead of the caller: image files
-(`frames::ImageFiles`, `syrup watch <op> <files>...`), or on Windows a live
-window (`frames::WindowCapture`, `syrup watch <op> --window TITLE`,
+(`frames::ImageFiles`, `syrup watch <op> <files>...`), or a live window
+(`frames::WindowCapture`, `syrup watch <op> --window TITLE`,
 `syrup.capture.window(title)`), captured with the core's `capture` module
-until it closes. Elsewhere window capture is a `DependencyError`.
+until it closes. The window is the first whose title contains the query,
+ignoring case; on Wayland, where titles are hidden, the desktop's portal
+asks the user to pick one and the choice is remembered for that query
+(under `$XDG_STATE_HOME/syrup/screencast`). Capture fails as an
+`input`-stage error: `bad_parameter` when no window matches,
+`missing_dependency` where it is unavailable (no display, no portal, macOS
+before 14), `permission_denied` when the user or the system refuses (on
+macOS, the Screen Recording permission), and `io` for anything else.
 
 Singular and plural mean the same: `find_face` returns every face, so
 `faces = find_face(img)` reads right. One result is spelled with a selector:
@@ -228,7 +235,7 @@ otherwise the class for the stage.
 
 | stage | class | kinds |
 |---|---|---|
-| `input` | `InputError` | `bad_image`, `bad_parameter` |
+| `input` | `InputError` | `bad_image`, `bad_parameter`, `permission_denied`, `missing_dependency`, `io` |
 | `resolve` | `IntentError` | `malformed`, `ambiguous`, `unsupported`, `conflicting` |
 | `plan` | `PlanError` | `invalid_plan` |
 | `generate`, `compile` | `BuildError` | `policy`, `compiler_failed`, `timeout`, `missing_dependency` |

@@ -156,7 +156,7 @@ fn run(args: &[String]) -> Result<(), Failure> {
             }
         }
         Some("windows") => {
-            for title in WindowCapture::windows() {
+            for title in WindowCapture::windows()? {
                 println!("{title}");
             }
         }

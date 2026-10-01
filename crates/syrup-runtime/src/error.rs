@@ -49,6 +49,7 @@ named_enum!(ErrorKind {
     InvalidPlan => "invalid_plan",
     Policy => "policy",
     MissingDependency => "missing_dependency",
+    PermissionDenied => "permission_denied",
     CompilerFailed => "compiler_failed",
     Timeout => "timeout",
     NotPrepared => "not_prepared",

@@ -240,16 +240,21 @@ def test_sessions_follow_objects_across_frames():
         syrup.ops.find_faces.session()
 
 
-def test_layout_targets_and_frame_sources():
+def test_text_blocks():
     page = PILImage.open(FIXTURES / "words.png")
     (block,) = syrup.ops.find_text_blocks(page)
     assert block.label == "text_block" and block.box.w > 100
 
-    if sys.platform == "win32":
-        assert isinstance(syrup.capture.windows(), list)
-        with pytest.raises(syrup.InputError):
-            next(syrup.capture.window("no window is called this 7f3a"))
-    else:
-        assert syrup.capture.windows() == []
-        with pytest.raises(syrup.DependencyError):
-            next(syrup.capture.window("anything"))
+
+@pytest.mark.skipif("SYRUP_TEST_WINDOW" not in os.environ, reason="CI opens a window to capture")
+def test_live_windows_feed_sessions():
+    title = os.environ["SYRUP_TEST_WINDOW"]
+    assert any(title in t for t in syrup.capture.windows())
+    with pytest.raises(syrup.InputError):
+        next(syrup.capture.window("no window is called this 7f3a"))
+
+    session = syrup.ops.track_moving_regions.session()
+    frames = list(syrup.capture.window(title, frames=2))
+    assert len(frames) == 2 and frames[0].width > 0 and frames[0].height > 0
+    results = [session(frame) for frame in frames]
+    assert results[1].provenance.frame == 2

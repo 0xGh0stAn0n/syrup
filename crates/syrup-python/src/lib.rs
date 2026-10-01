@@ -384,20 +384,50 @@ fn vocabulary() -> String {
 }
 
 #[pyfunction]
-fn list_windows() -> Vec<String> {
-    WindowCapture::windows()
+fn list_windows(py: Python<'_>) -> PyResult<Vec<String>> {
+    py.detach(WindowCapture::windows).map_err(raise)
 }
 
-/// One frame of the first window whose title contains `title`.
-#[pyfunction]
-fn capture_window(py: Python<'_>, title: &str) -> PyResult<(Py<PyBytes>, u32, u32, u32)> {
-    let mut window = WindowCapture::new(title).map_err(raise)?;
-    let frame = py
-        .detach(|| window.next_frame())
-        .map_err(raise)?
-        .expect("a window's first capture either succeeds or fails");
-    let data = PyBytes::new(py, &frame.data).unbind();
-    Ok((data, frame.width, frame.height, frame.channels))
+/// Pixels, width, height and channels, as `syrup.Image` takes them.
+type Frame = (Py<PyBytes>, u32, u32, u32);
+
+/// A live window, captured frame by frame.
+#[pyclass(name = "Window")]
+struct PyWindow {
+    title: String,
+    capture: Mutex<WindowCapture>,
+}
+
+#[pymethods]
+impl PyWindow {
+    #[new]
+    fn new(py: Python<'_>, query: &str) -> PyResult<PyWindow> {
+        let capture = py.detach(|| WindowCapture::new(query)).map_err(raise)?;
+        Ok(PyWindow {
+            title: capture.title().to_string(),
+            capture: Mutex::new(capture),
+        })
+    }
+
+    #[getter]
+    fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// The next frame as (pixels, width, height, channels), or None once
+    /// the window has closed.
+    fn capture(&self, py: Python<'_>) -> PyResult<Option<Frame>> {
+        let frame = py
+            .detach(|| {
+                let mut capture = self.capture.lock().unwrap_or_else(|e| e.into_inner());
+                capture.next_frame()
+            })
+            .map_err(raise)?;
+        Ok(frame.map(|frame| {
+            let data = PyBytes::new(py, &frame.data).unbind();
+            (data, frame.width, frame.height, frame.channels)
+        }))
+    }
 }
 
 #[pyfunction]
@@ -417,7 +447,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bundle, m)?)?;
     m.add_function(wrap_pyfunction!(vocabulary, m)?)?;
     m.add_function(wrap_pyfunction!(list_windows, m)?)?;
-    m.add_function(wrap_pyfunction!(capture_window, m)?)?;
+    m.add_class::<PyWindow>()?;
     m.add_function(wrap_pyfunction!(cache_dir, m)?)?;
     Ok(())
 }

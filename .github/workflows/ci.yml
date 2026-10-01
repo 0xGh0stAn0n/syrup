@@ -29,12 +29,10 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y tesseract-ocr
       - name: Open a window to capture
-        if: runner.os == 'Windows'
-        run: Start-Process notepad
+        shell: bash
+        run: .github/open-window.sh
       - name: Test
         run: cargo test --workspace
-        env:
-          SYRUP_EXPECT_WINDOW: ${{ runner.os == 'Windows' && '1' || '' }}
       - name: Build
         run: cargo build --workspace --all-targets
 
@@ -65,8 +63,28 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y tesseract-ocr
       - name: Install
         run: pip install "./python[test]" opencv-python-headless
+      - name: Open a window to capture
+        shell: bash
+        run: .github/open-window.sh
       - name: Test
         run: pytest python/tests
+
+  # Wayland capture, against a real PipeWire server with a stand-in for the
+  # desktop's screen-cast portal (tests/portal).
+  wayland:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dbus-x11 pipewire pipewire-bin wireplumber \
+            gstreamer1.0-pipewire gstreamer1.0-tools gstreamer1.0-plugins-base \
+            python3-dbus python3-gi
+      - name: Test
+        run: tests/portal/run.sh
 
   # The model recipes, on real photographs. Heavy dependencies, so a job of
   # their own; elsewhere these tests skip.

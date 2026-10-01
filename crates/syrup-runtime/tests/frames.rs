@@ -73,36 +73,17 @@ fn the_cli_watches_frames_one_json_line_each() {
     assert_eq!(lines[2]["provenance"]["frame"], 3);
 }
 
-#[cfg(not(target_os = "windows"))]
-#[test]
-fn window_capture_says_it_is_windows_only() {
-    let e = WindowCapture::new("anything").err().unwrap();
-    assert_eq!(e.kind, ErrorKind::MissingDependency);
-}
-
-#[cfg(target_os = "windows")]
+/// CI opens a window on each system and names it in SYRUP_TEST_WINDOW.
 #[test]
 fn windows_are_captured_into_sessions() {
-    let mut missing = WindowCapture::new("no window is called this 7f3a").unwrap();
-    assert_eq!(
-        missing.next_frame().unwrap_err().kind,
-        ErrorKind::BadParameter
-    );
-
-    // CI opens Notepad first and sets SYRUP_EXPECT_WINDOW, so there the
-    // capture cannot be skipped.
-    let windows = WindowCapture::windows();
-    let title = match windows
-        .iter()
-        .find(|t| t.contains("Notepad"))
-        .or(windows.first())
-    {
-        Some(title) => title.clone(),
-        None if std::env::var_os("SYRUP_EXPECT_WINDOW").is_some() => {
-            panic!("no capturable windows, but SYRUP_EXPECT_WINDOW is set")
-        }
-        None => return,
+    let Ok(title) = std::env::var("SYRUP_TEST_WINDOW") else {
+        return;
     };
+    let missing = WindowCapture::new("no window is called this 7f3a").err();
+    assert_eq!(missing.map(|e| e.kind), Some(ErrorKind::BadParameter));
+    let listed = WindowCapture::windows().unwrap();
+    assert!(listed.iter().any(|t| t.contains(&title)), "{listed:?}");
+
     let cache = TempDir::new();
     let runtime = Runtime::new(config(&cache.0));
     let mut session = runtime
@@ -111,11 +92,13 @@ fn windows_are_captured_into_sessions() {
         .session(SessionOptions::default())
         .unwrap();
     let mut window = WindowCapture::new(&title).unwrap();
-    for _ in 0..2 {
+    assert!(window.title().contains(&title));
+    for frame in 1..=2 {
         let result = session
             .next(&mut window, &RunParams::default())
             .unwrap()
             .expect("the window is still open");
-        assert!(result.provenance.image.0 > 0);
+        assert_eq!(result.provenance.frame, Some(frame));
+        assert!(result.provenance.image.0 > 0 && result.provenance.image.1 > 0);
     }
 }

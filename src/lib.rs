@@ -3,7 +3,7 @@
 //!
 //! The library operates on plain [`image::RgbaImage`] buffers, so frames can
 //! come from anywhere — a screenshot on disk, frames extracted from a video,
-//! a synthetic test fixture, or a live window capture (Windows only) — and
+//! a synthetic test fixture, or a live window capture — and
 //! every primitive behaves identically regardless of the source.
 //!
 //! ```text
@@ -26,7 +26,8 @@
 //! - [`ocr`]: text recognition via a Tesseract subprocess, or the OCR engine
 //!   built into Windows.
 //! - [`quality`]: is a region sharp enough for OCR to stand a chance?
-//! - [`capture`]: window capture by title (Windows; stubs elsewhere).
+//! - [`capture`]: live window capture by title on Windows, macOS and Linux
+//!   (X11 and Wayland).
 //! - [`draw`]: debug-overlay primitives — rectangles and a small bitmap font.
 //! - [`timing`]: FPS and moving-average measurement.
 //!

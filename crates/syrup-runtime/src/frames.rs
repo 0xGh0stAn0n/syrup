@@ -1,7 +1,8 @@
-//! Where a session's frames come from: image files anywhere, or a live
-//! window on Windows.
+//! Where a session's frames come from: image files, or a live window.
 
 use std::path::PathBuf;
+
+use syrup::capture::{CaptureError, Window};
 
 use crate::contract::OwnedImage;
 use crate::error::{ErrorKind, Result, Stage, SyrupError};
@@ -33,56 +34,64 @@ impl FrameSource for ImageFiles {
     }
 }
 
-/// A window's client area, captured with the core's `capture` module, until
-/// the window goes away. Windows only.
+/// A window's contents, captured with the core's `capture` module until
+/// the window closes.
 pub struct WindowCapture {
-    title: String,
-    captured: u64,
+    window: Window,
+}
+
+fn capture_error(e: CaptureError, query: &str) -> SyrupError {
+    let (kind, reason) = match e {
+        CaptureError::NotFound => (
+            ErrorKind::BadParameter,
+            format!("no window title contains {query:?}"),
+        ),
+        CaptureError::Closed => (ErrorKind::BadParameter, "the window was closed".into()),
+        CaptureError::Unavailable(reason) => (ErrorKind::MissingDependency, reason),
+        CaptureError::Denied(reason) => (ErrorKind::PermissionDenied, reason),
+        CaptureError::Failed(reason) => (ErrorKind::Io, reason),
+    };
+    let error = SyrupError::new(Stage::Input, kind, reason);
+    match kind {
+        ErrorKind::BadParameter => {
+            error.with_hint("`syrup windows` lists the windows that can be captured")
+        }
+        _ => error,
+    }
 }
 
 impl WindowCapture {
-    /// The first window whose title contains `title`.
-    pub fn new(title: &str) -> Result<WindowCapture> {
-        if !cfg!(target_os = "windows") {
-            return Err(SyrupError::new(
-                Stage::Input,
-                ErrorKind::MissingDependency,
-                "window capture is only available on Windows",
-            )
-            .with_hint("on other systems, feed frames from files or your own capture"));
-        }
-        Ok(WindowCapture {
-            title: title.to_string(),
-            captured: 0,
-        })
+    /// The first window whose title contains `query`, ignoring case. On a
+    /// Wayland desktop the user picks the window the first time.
+    pub fn new(query: &str) -> Result<WindowCapture> {
+        Window::find(query)
+            .map(|window| WindowCapture { window })
+            .map_err(|e| capture_error(e, query))
     }
 
-    /// Titles of the windows that can be captured.
-    pub fn windows() -> Vec<String> {
-        syrup::capture::list_windows()
+    /// The window's full title.
+    pub fn title(&self) -> &str {
+        self.window.title()
+    }
+
+    /// Titles of the windows that can be captured without asking the user.
+    pub fn windows() -> Result<Vec<String>> {
+        syrup::capture::list_windows().map_err(|e| capture_error(e, ""))
     }
 }
 
 impl FrameSource for WindowCapture {
-    /// Fails if the window never existed; ends when it closes.
+    /// Ends when the window closes.
     fn next_frame(&mut self) -> Result<Option<OwnedImage>> {
-        match syrup::capture::capture_window_by_title_info(&self.title) {
-            Some((_, image)) => {
-                self.captured += 1;
-                Ok(Some(OwnedImage {
-                    width: image.width(),
-                    height: image.height(),
-                    channels: 4,
-                    data: image.into_raw(),
-                }))
-            }
-            None if self.captured == 0 => Err(SyrupError::new(
-                Stage::Input,
-                ErrorKind::BadParameter,
-                format!("no window title contains {:?}", self.title),
-            )
-            .with_hint("`syrup windows` lists the windows that can be captured")),
-            None => Ok(None),
+        match self.window.capture() {
+            Ok(image) => Ok(Some(OwnedImage {
+                width: image.width(),
+                height: image.height(),
+                channels: 4,
+                data: image.into_raw(),
+            })),
+            Err(CaptureError::Closed) => Ok(None),
+            Err(e) => Err(capture_error(e, self.window.title())),
         }
     }
 }

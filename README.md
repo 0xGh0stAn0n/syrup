@@ -39,8 +39,8 @@ blurry = [w for w in measure_sharpness_of_words(frame) if w.value < 0.35]
 ```
 
 Video goes through sessions, which keep ids across frames with the core's
-tracker. On Windows, `syrup.capture.window("title")` yields a live window's
-frames:
+tracker. `syrup.capture.window("title")` yields a live window's frames on
+Windows, macOS and Linux:
 
 ```python
 session = syrup.ops.track_moving_regions_in_top_half.session()
@@ -123,8 +123,12 @@ the design.
 - **Quality** — a sharpness metric that predicts whether OCR on a region
   can succeed at all, so blurred input is reported as *blurred* rather than
   silently producing wrong text.
-- **Capture** — live window capture by title on Windows (works while the
-  window is occluded); portable stubs elsewhere.
+- **Capture** — live window capture by title. Windows (`PrintWindow`), X11
+  (the Composite extension) and macOS 14+ (ScreenCaptureKit) capture a
+  covered window as drawn; macOS needs the Screen Recording permission. On
+  Wayland the desktop's screen-cast portal asks the user to pick the
+  window once per title and remembers the choice; frames arrive over
+  PipeWire, which is loaded only when used.
 - **Debug drawing** — rectangles and a dependency-free 5×7 bitmap font for
   annotating frames with what a detector saw.
 
@@ -220,8 +224,12 @@ on a domain edition, so this repository stands alone.
   fonts, hard edges), not for photographs or video of natural scenes.
 - Tesseract must be installed separately for OCR (`TESSERACT_BIN` or
   `PATH`); without it, OCR reports itself unavailable rather than failing.
-- Live capture is Windows-only. Other platforms consume file-based frames,
-  which sessions take one at a time.
+- On Wayland, other applications' window titles are hidden, so the user
+  picks the window the first time a title is used (X11 applications under
+  XWayland are found by title). Desktops whose portal can only share whole
+  screens, such as xdg-desktop-portal-wlr before 0.8, cannot share a
+  window.
+- macOS capture needs macOS 14 or later.
 - Operations by name currently cover faces, printed words, and colour
   regions and bars. Compiling a new operation needs `rustc` where it first
   runs, or a bundle prepared elsewhere.
