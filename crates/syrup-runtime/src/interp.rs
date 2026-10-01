@@ -1,19 +1,54 @@
 //! Reference semantics for plans. Validation runs every compiled module
 //! against this interpreter; it never serves real calls. It is written
-//! independently of the code generator so a slip in either shows up as a
-//! mismatch.
+//! independently of the code generator, and finds colours with the core's
+//! own primitives, so a slip in either shows up as a mismatch.
 
 use std::cmp::Ordering;
 
-use crate::abi::{SYRUP_MAX_KEYPOINTS, SyrupDetection, SyrupParams};
+use image::{Rgba, RgbaImage};
+use syrup::color::is_color_pixel;
+use syrup::geometry::segment_row;
+
+use crate::abi::{SYRUP_MAX_KEYPOINTS, SyrupDetection, SyrupParams, SyrupRect, SyrupRun};
 use crate::catalog::Capability;
+use crate::contract::ImageInput;
 use crate::error::{ErrorKind, Result, Stage, SyrupError};
 use crate::intent::{OrderKey, PixelRect, RegionSpec};
 use crate::plan::{Plan, Step};
 
-pub trait Detector {
+/// What the host gives a plan: detectors, and the core's region grouping.
+pub trait Host {
     /// `view` is in input pixels and never empty.
     fn detect(&mut self, capability: Capability, view: PixelRect) -> Result<Vec<SyrupDetection>>;
+    fn group(&mut self, runs: &[SyrupRun], min_height: u32, max_gap: u32) -> Vec<SyrupRect>;
+}
+
+/// The core's grouping, as the real host and the validator's mock use it.
+pub fn group_runs(runs: &[SyrupRun], min_height: u32, max_gap: u32) -> Vec<SyrupRect> {
+    let rows = runs.iter().map(|r| (r.y, r.x0, r.x1)).collect();
+    syrup::geometry::group_segments(rows, min_height, max_gap)
+        .into_iter()
+        .map(|r| SyrupRect {
+            x: r.x,
+            y: r.y,
+            w: r.w,
+            h: r.h,
+        })
+        .collect()
+}
+
+/// The pixels of `view`, as RGBA.
+fn window(image: &ImageInput<'_>, view: PixelRect) -> RgbaImage {
+    let (data, stride, c) = (image.data(), image.stride(), image.channels() as usize);
+    RgbaImage::from_fn(view.w, view.h, |x, y| {
+        let at = (view.y + y) as usize * stride + (view.x + x) as usize * c;
+        let p = &data[at..at + c];
+        Rgba(match c {
+            1 => [p[0], p[0], p[0], 255],
+            3 => [p[0], p[1], p[2], 255],
+            _ => [p[0], p[1], p[2], p[3]],
+        })
+    })
 }
 
 enum Value {
@@ -28,11 +63,11 @@ fn invalid(reason: impl Into<String>) -> SyrupError {
 
 pub fn run(
     plan: &Plan,
-    width: u32,
-    height: u32,
+    image: &ImageInput<'_>,
     params: &SyrupParams,
-    detector: &mut dyn Detector,
+    host: &mut dyn Host,
 ) -> Result<Vec<SyrupDetection>> {
+    let (width, height) = (image.width(), image.height());
     let mut values: Vec<Value> = Vec::with_capacity(plan.steps.len());
     let view = |values: &[Value], at: usize| -> Result<PixelRect> {
         match values.get(at) {
@@ -100,7 +135,58 @@ pub fn run(
                 if rect.w == 0 || rect.h == 0 {
                     Value::Boxes(Vec::new())
                 } else {
-                    Value::Boxes(detector.detect(capability, rect)?)
+                    Value::Boxes(host.detect(capability, rect)?)
+                }
+            }
+            Step::FindColor {
+                view: at,
+                hue,
+                min_saturation_pct,
+                min_value_pct,
+                min_run,
+                min_height,
+                max_gap,
+            } => {
+                let rect = view(&values, at)?;
+                if rect.w == 0 || rect.h == 0 {
+                    Value::Boxes(Vec::new())
+                } else {
+                    let pixels = window(image, rect);
+                    let hue = (hue.0 as f32, hue.1 as f32);
+                    let (sat, val) = (
+                        min_saturation_pct as f32 / 100.0,
+                        min_value_pct as f32 / 100.0,
+                    );
+                    let matches = |p: &Rgba<u8>| is_color_pixel(p, hue, sat, val);
+                    let mut runs = vec![];
+                    for y in 0..rect.h {
+                        for (x0, x1) in segment_row(&pixels, y, 0, rect.w - 1, min_run, matches) {
+                            runs.push(SyrupRun { y, x0, x1 });
+                        }
+                    }
+                    let boxes = host
+                        .group(&runs, min_height, max_gap)
+                        .into_iter()
+                        .map(|r| {
+                            let mut hits = 0u32;
+                            for y in r.y..r.y + r.h {
+                                for x in r.x..r.x + r.w {
+                                    hits += matches(pixels.get_pixel(x, y)) as u32;
+                                }
+                            }
+                            SyrupDetection {
+                                x: r.x as f32,
+                                y: r.y as f32,
+                                w: r.w as f32,
+                                h: r.h as f32,
+                                score: hits as f32 / (r.w * r.h) as f32,
+                                n_keypoints: 0,
+                                keypoints: [0.0; 2 * SYRUP_MAX_KEYPOINTS],
+                                payload: 0,
+                            }
+                        })
+                        .collect();
+                    Value::Boxes(boxes)
                 }
             }
             Step::Restore { boxes, view: at } => {
@@ -110,6 +196,11 @@ pub fn run(
             Step::FilterConfidence { boxes } => {
                 let mut kept = take(&mut values, boxes)?;
                 kept.retain(|d| d.score >= params.min_confidence);
+                Value::Boxes(kept)
+            }
+            Step::FilterAspect { boxes, min } => {
+                let mut kept = take(&mut values, boxes)?;
+                kept.retain(|d| d.w >= min as f32 * d.h);
                 Value::Boxes(kept)
             }
             Step::FilterArea {
@@ -242,10 +333,14 @@ mod tests {
         seen: Vec<PixelRect>,
     }
 
-    impl Detector for Fixed {
+    impl Host for Fixed {
         fn detect(&mut self, _: Capability, view: PixelRect) -> Result<Vec<SyrupDetection>> {
             self.seen.push(view);
             Ok(self.boxes.clone())
+        }
+
+        fn group(&mut self, runs: &[SyrupRun], min_height: u32, max_gap: u32) -> Vec<SyrupRect> {
+            group_runs(runs, min_height, max_gap)
         }
     }
 
@@ -261,8 +356,68 @@ mod tests {
             boxes,
             seen: vec![],
         };
-        let out = run(&plan, w, h, &p, &mut detector).unwrap();
+        let pixels = vec![0u8; (w * h * 3) as usize];
+        let image = ImageInput::new(&pixels, w, h, 3).unwrap();
+        let out = run(&plan, &image, &p, &mut detector).unwrap();
         (out, detector.seen)
+    }
+
+    #[test]
+    fn colour_regions_are_found_scored_and_restored() {
+        // Grey 60x40 with a solid red 20x6 bar at (10, 30) and a 10x10 red ring.
+        let mut pixels = vec![120u8; 60 * 40 * 3];
+        let mut paint =
+            |x: usize, y: usize| pixels[(y * 60 + x) * 3..][..3].copy_from_slice(&[220, 30, 30]);
+        for y in 30..36 {
+            for x in 10..30 {
+                paint(x, y);
+            }
+        }
+        for y in 2..12 {
+            for x in 40..50 {
+                if !(6..8).contains(&y) || !(44..46).contains(&x) {
+                    paint(x, y);
+                }
+            }
+        }
+        let image = ImageInput::new(&pixels, 60, 40, 3).unwrap();
+        let run_plan = |name: &str| {
+            let plan = Plan::build(&parse(name).unwrap()).unwrap();
+            let mut host = Fixed {
+                boxes: vec![],
+                seen: vec![],
+            };
+            let mut p = params();
+            p.min_confidence = 0.0;
+            run(&plan, &image, &p, &mut host).unwrap()
+        };
+
+        let regions = run_plan("find_red_regions_by_size");
+        assert_eq!(regions.len(), 2);
+        assert_eq!(
+            (
+                regions[0].x,
+                regions[0].y,
+                regions[0].w,
+                regions[0].h,
+                regions[0].score
+            ),
+            (10.0, 30.0, 20.0, 6.0, 1.0)
+        );
+        assert_eq!(
+            (regions[1].x, regions[1].y, regions[1].w, regions[1].h),
+            (40.0, 2.0, 10.0, 10.0)
+        );
+        assert!(
+            (regions[1].score - 0.96).abs() < 1e-6,
+            "the ring fills 96 of 100 pixels"
+        );
+
+        let bars = run_plan("find_red_bars");
+        assert_eq!(bars.len(), 1, "only the bar is 3x wider than tall");
+        let lower = run_plan("find_red_regions_in_bottom_half");
+        assert_eq!((lower.len(), lower[0].y), (1, 30.0));
+        assert!(run_plan("find_blue_regions").is_empty());
     }
 
     #[test]

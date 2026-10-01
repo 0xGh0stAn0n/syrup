@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::catalog::{self, Capability};
+use crate::catalog::{self, Capability, Finder};
 use crate::error::{ErrorKind, Result, Stage, SyrupError};
 use crate::intent::{Intent, NormRect, OrderKey, RegionSpec};
 
@@ -26,6 +26,18 @@ pub enum Step {
         view: usize,
         capability: Capability,
     },
+    /// Runs of pixels whose hue lies in `hue` (degrees, wrapping when the
+    /// start is larger), grouped into regions by the core's grouping. A
+    /// region's score is the share of its pixels that match.
+    FindColor {
+        view: usize,
+        hue: (u32, u32),
+        min_saturation_pct: u32,
+        min_value_pct: u32,
+        min_run: u32,
+        min_height: u32,
+        max_gap: u32,
+    },
     /// Moves boxes from `view`'s space to input space and clips them to the
     /// view; boxes left without area are dropped.
     Restore {
@@ -34,6 +46,11 @@ pub enum Step {
     },
     FilterConfidence {
         boxes: usize,
+    },
+    /// Keeps boxes at least `min` times wider than tall.
+    FilterAspect {
+        boxes: usize,
+        min: u32,
     },
     FilterArea {
         boxes: usize,
@@ -61,9 +78,12 @@ impl Step {
     pub fn inputs(&self) -> Vec<usize> {
         match *self {
             Step::Input => vec![],
-            Step::SelectRegion { view, .. } | Step::Detect { view, .. } => vec![view],
+            Step::SelectRegion { view, .. }
+            | Step::Detect { view, .. }
+            | Step::FindColor { view, .. } => vec![view],
             Step::Restore { boxes, view } => vec![boxes, view],
             Step::FilterConfidence { boxes }
+            | Step::FilterAspect { boxes, .. }
             | Step::FilterArea { boxes, .. }
             | Step::Order { boxes, .. }
             | Step::Limit { boxes, .. }
@@ -109,10 +129,39 @@ impl Plan {
             Some(region) => push(Step::SelectRegion { view: 0, region }),
             None => 0,
         };
-        let capability = catalog::entry(intent.target).capability;
-        let mut boxes = push(Step::Detect { view, capability });
+        let finder = catalog::entry(intent.target).finder;
+        let mut boxes = match (finder, intent.color) {
+            (Finder::Detect(capability), _) => push(Step::Detect { view, capability }),
+            (
+                Finder::Color {
+                    min_run,
+                    min_height,
+                    max_gap,
+                    ..
+                },
+                Some(color),
+            ) => push(Step::FindColor {
+                view,
+                hue: catalog::color(color).hue,
+                min_saturation_pct: catalog::MIN_SATURATION_PCT,
+                min_value_pct: catalog::MIN_VALUE_PCT,
+                min_run,
+                min_height,
+                max_gap,
+            }),
+            (Finder::Color { .. }, None) => {
+                return Err(invalid("a colour target without a colour"));
+            }
+        };
         boxes = push(Step::Restore { boxes, view });
         boxes = push(Step::FilterConfidence { boxes });
+        if let Finder::Color {
+            min_aspect: Some(min),
+            ..
+        } = finder
+        {
+            boxes = push(Step::FilterAspect { boxes, min });
+        }
         if intent.min_area_pct.is_some() || intent.max_area_pct.is_some() {
             boxes = push(Step::FilterArea {
                 boxes,
@@ -189,7 +238,23 @@ impl Plan {
                     }
                     ValueType::View(Space::Region(i))
                 }
-                Step::Detect { view, .. } => match types[view] {
+                Step::FindColor {
+                    hue,
+                    min_saturation_pct,
+                    min_value_pct,
+                    min_run,
+                    min_height,
+                    ..
+                } if hue.0 >= 360
+                    || hue.1 >= 360
+                    || min_saturation_pct > 100
+                    || min_value_pct > 100
+                    || min_run == 0
+                    || min_height == 0 =>
+                {
+                    return Err(invalid(format!("step {i}: colour thresholds out of range")));
+                }
+                Step::Detect { view, .. } | Step::FindColor { view, .. } => match types[view] {
                     ValueType::View(space) => ValueType::Boxes {
                         space,
                         clipped: false,
@@ -225,7 +290,10 @@ impl Plan {
                     }
                     restored(boxes)?
                 }
-                Step::Limit { n: 0, .. } => return Err(invalid(format!("step {i}: limit of 0"))),
+                Step::Limit { n: 0, .. } | Step::FilterAspect { min: 0, .. } => {
+                    return Err(invalid(format!("step {i}: a bound of 0")));
+                }
+                Step::FilterAspect { boxes, .. } => restored(boxes)?,
                 Step::Order { boxes, .. }
                 | Step::Limit { boxes, .. }
                 | Step::LimitParam { boxes } => restored(boxes)?,
@@ -292,8 +360,25 @@ impl Plan {
                 Step::Restore { boxes, view } => {
                     format!("restore v{boxes} from v{view} to input coordinates, clipped")
                 }
+                Step::FindColor {
+                    view,
+                    hue,
+                    min_saturation_pct,
+                    min_value_pct,
+                    min_run,
+                    min_height,
+                    max_gap,
+                } => format!(
+                    "find hue {}-{} deg (saturation >= {min_saturation_pct}%, value >= \
+                     {min_value_pct}%) in v{view}: runs >= {min_run} px, regions >= \
+                     {min_height} rows, gaps <= {max_gap}",
+                    hue.0, hue.1
+                ),
                 Step::FilterConfidence { boxes } => {
                     format!("keep v{boxes} with confidence >= min_confidence")
+                }
+                Step::FilterAspect { boxes, min } => {
+                    format!("keep v{boxes} at least {min}x wider than tall")
                 }
                 Step::FilterArea {
                     boxes,

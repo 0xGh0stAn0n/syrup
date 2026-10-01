@@ -8,11 +8,12 @@ use std::ffi::c_void;
 
 use crate::abi::*;
 use crate::catalog::Capability;
+use crate::contract::ImageInput;
 use crate::error::{ErrorKind, Result, Stage, SyrupError};
 use crate::intent::PixelRect;
-use crate::interp::{self, Detector};
+use crate::interp::{self, Host, group_runs};
 use crate::loader::Module;
-use crate::plan::Plan;
+use crate::plan::{Plan, Step};
 
 const SIZES: &[(u32, u32)] = &[
     (1, 1),
@@ -94,10 +95,15 @@ struct MockHost {
     channels: u32,
     seed: u64,
     scratch: Vec<SyrupDetection>,
+    rects: Vec<SyrupRect>,
     calls: Vec<PixelRect>,
+    groups: Vec<Grouping>,
     out: Vec<SyrupDetection>,
     fault: Option<String>,
 }
+
+/// A call to `group`, as made.
+type Grouping = (Vec<SyrupRun>, u32, u32);
 
 impl MockHost {
     fn locate(&self, view: &SyrupImageView) -> std::result::Result<PixelRect, String> {
@@ -160,6 +166,30 @@ unsafe extern "C" fn mock_detect(
     }
 }
 
+unsafe extern "C" fn mock_group(
+    ctx: *mut c_void,
+    runs: *const SyrupRun,
+    n_runs: usize,
+    min_height: u32,
+    max_gap: u32,
+    out_ptr: *mut *const SyrupRect,
+    out_len: *mut usize,
+) -> i32 {
+    // SAFETY: as in mock_detect; `runs` holds `n_runs` runs.
+    let host = unsafe { &mut *(ctx as *mut MockHost) };
+    let runs = match n_runs {
+        0 => vec![],
+        n => unsafe { std::slice::from_raw_parts(runs, n) }.to_vec(),
+    };
+    host.rects = group_runs(&runs, min_height, max_gap);
+    host.groups.push((runs, min_height, max_gap));
+    unsafe {
+        *out_ptr = host.rects.as_ptr();
+        *out_len = host.rects.len();
+    }
+    SYRUP_OK
+}
+
 unsafe extern "C" fn mock_emit(ctx: *mut c_void, detection: *const SyrupDetection) -> i32 {
     // SAFETY: as in mock_detect.
     unsafe { (*(ctx as *mut MockHost)).out.push(*detection) };
@@ -169,13 +199,98 @@ unsafe extern "C" fn mock_emit(ctx: *mut c_void, detection: *const SyrupDetectio
 struct Oracle {
     seed: u64,
     calls: Vec<PixelRect>,
+    groups: Vec<Grouping>,
 }
 
-impl Detector for Oracle {
+impl Host for Oracle {
     fn detect(&mut self, capability: Capability, view: PixelRect) -> Result<Vec<SyrupDetection>> {
         self.calls.push(view);
         Ok(mock_detections(self.seed, capability.abi_id(), view))
     }
+
+    fn group(&mut self, runs: &[SyrupRun], min_height: u32, max_gap: u32) -> Vec<SyrupRect> {
+        self.groups.push((runs.to_vec(), min_height, max_gap));
+        group_runs(runs, min_height, max_gap)
+    }
+}
+
+/// An RGB colour with the given hue (degrees), saturation and value.
+fn from_hsv(h: f32, s: f32, v: f32) -> [u8; 3] {
+    let c = v * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let (r, g, b) = match (h / 60.0) as u32 % 6 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = v - c;
+    [r, g, b].map(|channel| ((channel + m) * 255.0).round() as u8)
+}
+
+/// Grey noise with rectangles, solid or speckled, of random colours. Half
+/// of them take a hue the plan looks for, so colour plans always have
+/// regions to find.
+fn synthetic_image(
+    rng: &mut SplitMix,
+    plan: &Plan,
+    width: u32,
+    height: u32,
+    stride: usize,
+    channels: u32,
+) -> Vec<u8> {
+    let hues: Vec<(u32, u32)> = plan
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            Step::FindColor { hue, .. } => Some(*hue),
+            _ => None,
+        })
+        .collect();
+    let mut image = vec![0u8; stride * height as usize];
+    let c = channels as usize;
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            let grey = 100 + rng.below(40) as u8;
+            image[y * stride + x * c..][..c].fill(grey);
+        }
+    }
+    for _ in 0..rng.below(6) {
+        let (x0, y0) = (
+            rng.below(width as u64) as usize,
+            rng.below(height as u64) as usize,
+        );
+        let (w, h) = (
+            1 + rng.below(width as u64) as usize,
+            1 + rng.below(height as u64) as usize,
+        );
+        let alpha = 100 + rng.below(156) as u8;
+        let color = match hues.get(rng.below(2 * hues.len().max(1) as u64) as usize) {
+            Some(&(lo, hi)) => {
+                let span = (hi + 360 - lo) % 360;
+                let hue = (lo as f32 + rng.unit() * span as f32) % 360.0;
+                let [r, g, b] = from_hsv(hue, 0.3 + 0.7 * rng.unit(), 0.25 + 0.75 * rng.unit());
+                [r, g, b, alpha]
+            }
+            None => [
+                rng.below(256) as u8,
+                rng.below(256) as u8,
+                rng.below(256) as u8,
+                alpha,
+            ],
+        };
+        let speckled = rng.below(3) == 0;
+        for y in y0..(y0 + h).min(height as usize) {
+            for x in x0..(x0 + w).min(width as usize) {
+                if !speckled || rng.below(4) != 0 {
+                    image[y * stride + x * c..][..c].copy_from_slice(&color[..c]);
+                }
+            }
+        }
+    }
+    image
 }
 
 fn same(a: &SyrupDetection, b: &SyrupDetection) -> bool {
@@ -201,7 +316,7 @@ pub fn check(module: &Module, plan: &Plan) -> Result<u32> {
     for (index, &(width, height)) in SIZES.iter().enumerate() {
         for channels in [1u32, 3, 4] {
             let stride = (width * channels) as usize + index % 3;
-            let image = vec![0u8; stride * height as usize];
+            let image = synthetic_image(&mut rng, plan, width, height, stride, channels);
             let region = (
                 rng.below(width as u64 + 1) as u32,
                 rng.below(height as u64 + 1) as u32,
@@ -226,7 +341,9 @@ pub fn check(module: &Module, plan: &Plan) -> Result<u32> {
                 channels,
                 seed,
                 scratch: vec![],
+                rects: vec![],
                 calls: vec![],
+                groups: vec![],
                 out: vec![],
                 fault: None,
             };
@@ -236,6 +353,7 @@ pub fn check(module: &Module, plan: &Plan) -> Result<u32> {
                 ctx: (&raw mut host).cast(),
                 detect: mock_detect,
                 emit: mock_emit,
+                group: mock_group,
             };
             let input = SyrupImageView {
                 data: image.as_ptr(),
@@ -250,8 +368,10 @@ pub fn check(module: &Module, plan: &Plan) -> Result<u32> {
             let mut oracle = Oracle {
                 seed,
                 calls: vec![],
+                groups: vec![],
             };
-            let expected = interp::run(plan, width, height, &params, &mut oracle)?;
+            let pixels = ImageInput::with_stride(&image, width, height, stride, channels)?;
+            let expected = interp::run(plan, &pixels, &params, &mut oracle)?;
 
             let case = format!("{width}x{height}x{channels} stride {stride}, {params:?}");
             let mismatch = |reason: String| {
@@ -272,6 +392,12 @@ pub fn check(module: &Module, plan: &Plan) -> Result<u32> {
                 return Err(mismatch(format!(
                     "module looked at {:?}, expected {:?}",
                     host.calls, oracle.calls
+                )));
+            }
+            if host.groups != oracle.groups {
+                return Err(mismatch(format!(
+                    "module grouped {:?}, expected {:?}",
+                    host.groups, oracle.groups
                 )));
             }
             if host.out.len() != expected.len()
@@ -347,15 +473,19 @@ mod tests {
 
     #[test]
     fn faithful_modules_pass() {
-        let built = build(
+        for (i, name) in [
             "find_2_largest_faces_in_region_larger_than_1pct",
-            "faithful",
-            |s| format!("{s}\n"),
-        );
-        assert_eq!(
-            check(&built.module, &built.plan).unwrap(),
-            SIZES.len() as u32 * 3
-        );
+            "find_red_bars_in_bottom_half",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let built = build(name, &format!("faithful-{i}"), |s| format!("{s}\n"));
+            assert_eq!(
+                check(&built.module, &built.plan).unwrap(),
+                SIZES.len() as u32 * 3
+            );
+        }
     }
 
     #[test]
@@ -384,6 +514,22 @@ mod tests {
                 "(b.w * b.h).total_cmp(&(a.w * a.h))",
                 "(a.w * a.h).total_cmp(&(b.w * b.h))",
             )
+        });
+        mismatch(&built);
+    }
+
+    #[test]
+    fn a_wrong_colour_density_is_caught() {
+        let built = build("find_red_regions", "density", |s| {
+            s.replace("hits += pixel(p) as u32;", "hits += 1;")
+        });
+        mismatch(&built);
+    }
+
+    #[test]
+    fn a_loosened_hue_test_is_caught() {
+        let built = build("find_green_regions", "hue", |s| {
+            s.replace("h >= 70.0 && h <= 165.0", "h >= 60.0 && h <= 175.0")
         });
         mismatch(&built);
     }
