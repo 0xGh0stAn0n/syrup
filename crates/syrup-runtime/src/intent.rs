@@ -206,6 +206,9 @@ pub struct Intent {
     pub max_area_pct: Option<u32>,
     /// Set for `measure_*` operations: each item carries this quantity.
     pub measure: Option<Quantity>,
+    /// Set for `track_*` operations, which run in sessions over frames and
+    /// give each item an identity that lasts across them.
+    pub track: bool,
 }
 
 impl Intent {
@@ -219,12 +222,27 @@ impl Intent {
             min_area_pct: None,
             max_area_pct: None,
             measure: None,
+            track: false,
         }
     }
 
     pub fn check(&self) -> Result<()> {
         let entry = catalog::entry(self.target);
         let error = |kind, reason: String| Err(SyrupError::new(Stage::Resolve, kind, reason));
+        if self.target == Target::MovingRegion && !self.track {
+            return Err(SyrupError::new(
+                Stage::Resolve,
+                ErrorKind::Unsupported,
+                "moving regions only exist between frames",
+            )
+            .with_hint("track_moving_regions, in a session"));
+        }
+        if self.track && self.measure.is_some() {
+            return error(
+                ErrorKind::Conflicting,
+                "an operation either tracks or measures".into(),
+            );
+        }
         match (self.measure, self.target) {
             (None, Target::Image) => {
                 return error(
@@ -318,6 +336,7 @@ impl fmt::Display for Intent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.measure {
             Some(q) => write!(f, "measure {} of ", q.name())?,
+            None if self.track => f.write_str("track ")?,
             None => f.write_str("find ")?,
         }
         if let Some(color) = self.color {
@@ -346,7 +365,6 @@ const FIND_VERBS: &[&str] = &["find", "detect", "locate"];
 const OTHER_VERBS: &[(&str, &str)] = &[
     ("count", "use len(find_...) for now"),
     ("read", "reading text is not in the catalog yet"),
-    ("track", "tracking needs state across frames"),
     (
         "recognize",
         "Syrup locates things, it does not recognise identities",
@@ -561,7 +579,7 @@ pub fn is_reserved(word: &str) -> bool {
         "all", "in", "by", "than", "to", "pct", "percent", "larger", "bigger", "smaller",
     ];
     FIND_VERBS.contains(&word)
-        || ["measure", "of"].contains(&word)
+        || ["measure", "track", "of", "moving"].contains(&word)
         || Quantity::named(word).is_some()
         || OTHER_VERBS.iter().any(|(verb, _)| *verb == word)
         || SELECTORS.iter().any(|(words, _)| words.contains(&word))
@@ -746,6 +764,11 @@ pub fn parse(name: &str) -> Result<Intent> {
     p.pos += 1;
     let intent = if verb == "measure" {
         measure(&mut p)?
+    } else if verb == "track" {
+        Intent {
+            track: true,
+            ..find_body(&mut p)?
+        }
     } else if let Some((_, why)) = OTHER_VERBS.iter().find(|(v, _)| *v == verb) {
         return Err(p.error(
             ErrorKind::Unsupported,
@@ -1113,6 +1136,8 @@ mod tests {
             (Target::Bar, Some(Color::Red), Some(1), Some(Quantity::Fill))
         );
         assert_ne!(ok("measure_sharpness_of_faces"), ok("find_faces"));
+        assert!(ok("track_faces").track && !ok("find_faces").track);
+        assert_eq!(ok("track_moving_blobs").target, Target::MovingRegion);
 
         for (name, expected) in [
             ("measure", ErrorKind::Malformed),
@@ -1124,6 +1149,7 @@ mod tests {
             ("measure_sharpness_larger_than_5pct", ErrorKind::Conflicting),
             ("measure_sharpness_of", ErrorKind::Malformed),
             ("find_sharpness", ErrorKind::Unsupported),
+            ("find_moving_regions", ErrorKind::Unsupported),
         ] {
             assert_eq!(kind(name), expected, "{name}");
         }

@@ -38,6 +38,16 @@ from syrup.ops import measure_fill_of_largest_red_bar_in_bottom_third, measure_s
 blurry = [w for w in measure_sharpness_of_words(frame) if w.value < 0.35]
 ```
 
+Video goes through sessions, which keep ids across frames with the core's
+tracker:
+
+```python
+session = syrup.ops.track_moving_regions_in_top_half.session()
+for frame in frames:
+    for region in session(frame):
+        print(region.track.id, region.track.velocity)
+```
+
 Detectors from any Python library become nouns the same way:
 
 ```python
@@ -172,7 +182,8 @@ on a domain edition, so this repository stands alone.
   fonts, hard edges), not for photographs or video of natural scenes.
 - Tesseract must be installed separately for OCR (`TESSERACT_BIN` or
   `PATH`); without it, OCR reports itself unavailable rather than failing.
-- Live capture is Windows-only. Other platforms consume file-based frames.
+- Live capture is Windows-only. Other platforms consume file-based frames,
+  which sessions take one at a time.
 - Operations by name currently cover faces, printed words, and colour
   regions and bars. Compiling a new operation needs `rustc` where it first
   runs, or a bundle prepared elsewhere.

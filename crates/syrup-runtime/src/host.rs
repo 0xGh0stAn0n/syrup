@@ -13,11 +13,13 @@ use crate::catalog::Capability;
 use crate::contract::ImageInput;
 use crate::error::{ErrorKind, Result, Stage, SyrupError};
 use crate::interp::group_runs;
-use crate::providers::{Detections, Providers, ViewRef};
+use crate::providers::{Detections, Provider, Providers, ViewRef};
 
 pub struct ExecHost<'a> {
     image: ImageInput<'a>,
     providers: &'a Providers,
+    // A session's motion provider, which only sessions have.
+    motion: Option<&'a dyn Provider>,
     scratch: Vec<SyrupDetection>,
     rects: Vec<SyrupRect>,
     pub out: Vec<SyrupDetection>,
@@ -27,10 +29,15 @@ pub struct ExecHost<'a> {
 }
 
 impl<'a> ExecHost<'a> {
-    pub fn new(image: ImageInput<'a>, providers: &'a Providers) -> Self {
+    pub fn new(
+        image: ImageInput<'a>,
+        providers: &'a Providers,
+        motion: Option<&'a dyn Provider>,
+    ) -> Self {
         ExecHost {
             image,
             providers,
+            motion,
             scratch: vec![],
             rects: vec![],
             out: vec![],
@@ -91,7 +98,10 @@ impl<'a> ExecHost<'a> {
             )
         })?;
         let view = self.view(view)?;
-        let Detections { mut boxes, texts } = self.providers.get(capability)?.detect(&view)?;
+        let Detections { mut boxes, texts } = match (capability, self.motion) {
+            (Capability::Motion, Some(motion)) => motion.detect(&view)?,
+            _ => self.providers.get(capability)?.detect(&view)?,
+        };
         let malformed = |what: String| {
             SyrupError::new(
                 Stage::Execute,

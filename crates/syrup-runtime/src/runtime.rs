@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::abi::*;
 use crate::cache::{self, BundleIndex, Manifest, Store};
-use crate::catalog;
+use crate::catalog::{self, Capability};
 use crate::codegen;
 use crate::compiler::{HOST_TARGET, Rustc};
 use crate::contract::*;
@@ -16,8 +16,11 @@ use crate::host::{ExecHost, well_formed};
 use crate::intent::{self, Intent, PixelRect};
 use crate::loader::Module;
 use crate::plan::Plan;
-use crate::providers::{ModelSource, Providers};
+use crate::providers::motion::Motion;
+use crate::providers::{ModelSource, Provider, Providers};
 use crate::validate;
+use syrup::motion::MotionConfig;
+use syrup::tracking::ObjectTracker;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -458,11 +461,55 @@ impl Operation {
     }
 
     pub fn run(&self, image: &ImageInput<'_>, params: &RunParams) -> Result<FindResult> {
-        self.run_inner(image, params)
+        if self.intent.track {
+            return Err(SyrupError::new(
+                Stage::Input,
+                ErrorKind::BadParameter,
+                "track_ operations follow items across frames, so they run in a session",
+            )
+            .with_hint("session = op.session(), then session(frame) for each frame")
+            .for_operation(&self.name));
+        }
+        self.run_inner(image, params, None)
             .map_err(|e| e.for_operation(&self.name))
     }
 
-    fn run_inner(&self, image: &ImageInput<'_>, params: &RunParams) -> Result<FindResult> {
+    /// A session for a `track_*` operation: feed it frames in order.
+    pub fn session(&self, options: SessionOptions) -> Result<Session> {
+        let bad = |reason: String| {
+            Err(
+                SyrupError::new(Stage::Input, ErrorKind::BadParameter, reason)
+                    .for_operation(&self.name),
+            )
+        };
+        if !self.intent.track {
+            return bad(format!(
+                "{} looks at one image at a time; sessions are for track_ operations",
+                self.name
+            ));
+        }
+        if !(options.max_distance.is_finite() && options.max_distance > 0.0) {
+            return bad(format!(
+                "max_distance must be a positive number of pixels, got {}",
+                options.max_distance
+            ));
+        }
+        let motion = MotionConfig::default();
+        Ok(Session {
+            op: self.clone(),
+            tracker: ObjectTracker::new(options.max_distance, options.grace_frames),
+            motion: Motion::new(motion),
+            region: None,
+            frames: 0,
+        })
+    }
+
+    fn run_inner(
+        &self,
+        image: &ImageInput<'_>,
+        params: &RunParams,
+        motion: Option<&dyn Provider>,
+    ) -> Result<FindResult> {
         let entry = catalog::entry(self.intent.target);
         let bad = |reason: String| {
             Err(SyrupError::new(
@@ -518,7 +565,7 @@ impl Operation {
             region_w: region.map_or(0, |r| r.w),
             region_h: region.map_or(0, |r| r.h),
         };
-        let mut host = ExecHost::new(*image, &self.runtime.0.providers);
+        let mut host = ExecHost::new(*image, &self.runtime.0.providers, motion);
         let table = host.table();
         let executed_at = Instant::now();
         // SAFETY: `table` points at `host`, which stays in place until the
@@ -595,6 +642,7 @@ impl Operation {
                     .collect(),
                 text: (d.payload > 0).then(|| host.texts[d.payload as usize - 1].clone()),
                 value: measured.then_some(d.value),
+                track: None,
             })
             .collect();
         let manifest = &loaded.manifest;
@@ -617,8 +665,10 @@ impl Operation {
                     .plan
                     .capabilities()
                     .into_iter()
-                    .filter_map(|c| self.runtime.0.providers.get(c).ok())
-                    .map(|p| p.info())
+                    .filter_map(|c| match (c, motion) {
+                        (Capability::Motion, Some(motion)) => Some(motion.info()),
+                        _ => self.runtime.0.providers.get(c).ok().map(|p| p.info()),
+                    })
                     .collect(),
                 params: EffectiveParams {
                     min_confidence,
@@ -628,8 +678,100 @@ impl Operation {
                 image: (image.width(), image.height(), image.channels()),
                 prepare_ms,
                 execute_ms,
+                frame: None,
             },
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SessionOptions {
+    /// How far, in pixels, a box centre may move between frames and still be
+    /// the same object.
+    pub max_distance: f32,
+    /// How many frames an object may go unseen before its id is retired.
+    pub grace_frames: u32,
+}
+
+impl Default for SessionOptions {
+    fn default() -> Self {
+        let motion = MotionConfig::default();
+        SessionOptions {
+            max_distance: motion.track_match_distance,
+            grace_frames: motion.track_grace_frames,
+        }
+    }
+}
+
+/// Runs a `track_*` operation over frames: each frame goes through the same
+/// compiled module as the matching `find_*`, and the core's tracker gives
+/// each result an id that lasts while the object stays in view.
+pub struct Session {
+    op: Operation,
+    tracker: ObjectTracker,
+    motion: Motion,
+    region: Option<PixelRect>,
+    frames: u64,
+}
+
+impl Session {
+    pub fn operation(&self) -> &Operation {
+        &self.op
+    }
+
+    /// Objects seen in this frame. Ids of objects missing for a few frames
+    /// are kept, so they come back with the same id, but missing objects are
+    /// not reported.
+    pub fn update(&mut self, image: &ImageInput<'_>, params: &RunParams) -> Result<FindResult> {
+        let name = self.op.name.clone();
+        // Motion compares the same pixels from frame to frame.
+        if params.region != self.region {
+            self.motion.reset();
+            self.region = params.region;
+        }
+        let mut result = self
+            .op
+            .run_inner(image, params, Some(&self.motion))
+            .map_err(|e| e.for_operation(&name))?;
+        self.frames += 1;
+        let centres: Vec<(f32, f32, f32, f32)> = result
+            .items
+            .iter()
+            .map(|f| {
+                let b = f.bbox;
+                (b.x + b.w / 2.0, b.y + b.h / 2.0, b.w, b.h)
+            })
+            .collect();
+        let frame = self.tracker.frame_index() + 1;
+        let tracks = self.tracker.update(&centres);
+        let mut taken = vec![false; tracks.len()];
+        for (found, &(cx, cy, ..)) in result.items.iter_mut().zip(&centres) {
+            let at = (0..tracks.len())
+                .find(|&i| {
+                    let t = &tracks[i];
+                    !taken[i]
+                        && t.last_seen_frame == frame
+                        && t.position.x == cx
+                        && t.position.y == cy
+                })
+                .ok_or_else(|| {
+                    SyrupError::new(
+                        Stage::Execute,
+                        ErrorKind::ContractViolation,
+                        "the tracker lost a detection",
+                    )
+                    .for_operation(&name)
+                })?;
+            taken[at] = true;
+            let t = &tracks[at];
+            found.track = Some(TrackRef {
+                id: t.id,
+                age_frames: t.age_frames,
+                velocity: (t.velocity.x, t.velocity.y),
+            });
+        }
+        result.provenance.frame = Some(self.frames);
+        Ok(result)
     }
 }
 

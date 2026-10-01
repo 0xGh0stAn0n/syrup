@@ -211,7 +211,10 @@ fn changed_fraction(mask: &GrayImage) -> f32 {
     moved_pixels as f32 / total_pixels
 }
 
-fn extract_blobs(mask: &GrayImage, config: &MotionConfig) -> Vec<Rect> {
+/// Changed regions of a motion mask: runs of at least `min_run_width`
+/// grouped into blobs at least `min_blob_height` rows tall and
+/// `min_blob_area` pixels large.
+pub fn extract_blobs(mask: &GrayImage, config: &MotionConfig) -> Vec<Rect> {
     let (width, height) = mask.dimensions();
     let mut rows = Vec::new();
     for y in 0..height {

@@ -28,7 +28,7 @@ from .errors import (
     ValidationError,
     from_native,
 )
-from .results import Box, FindResult, Found, Provenance, from_json
+from .results import Box, FindResult, Found, Provenance, Track, from_json
 
 __all__ = [
     "Box",
@@ -44,7 +44,9 @@ __all__ = [
     "Operation",
     "PlanError",
     "Provenance",
+    "Session",
     "SyrupError",
+    "Track",
     "ValidationError",
     "add_target",
     "bundle",
@@ -150,17 +152,39 @@ class Operation:
         """Compile (or load) the native module now instead of on first call."""
         return json.loads(_call(self._native.prepare))
 
+    def session(self, *, max_distance=None, grace_frames=None):
+        """Follow a track_* operation's items across frames: call the session
+        with each frame in order, and each result carries `track.id`."""
+        return Session(self, _call(self._native.session, max_distance, grace_frames))
+
     def __call__(self, image, *, min_confidence=None, max_results=None, region=None):
-        pixels, width, height, channels = _pixels(image)
-        if region is not None:
-            region = _ints(region, 4, "region must be four non-negative ints (x, y, w, h)", self.name)
-        if max_results is not None:
-            (max_results,) = _ints([max_results], 1, "max_results must be a non-negative int", self.name)
-        result = _call(self._native.run, pixels, width, height, channels, min_confidence, max_results, region)
-        return from_json(result)
+        return from_json(_call(self._native.run, *_arguments(self.name, image, min_confidence, max_results, region)))
 
     def __repr__(self):
         return f"<syrup.Operation {self.name}: {self.intent}>"
+
+
+class Session:
+    """Frames in, tracked results out. See Operation.session."""
+
+    def __init__(self, operation, native):
+        self.operation, self._native = operation, native
+
+    def __call__(self, frame, *, min_confidence=None, max_results=None, region=None):
+        arguments = _arguments(self.operation.name, frame, min_confidence, max_results, region)
+        return from_json(_call(self._native.update, *arguments))
+
+    def __repr__(self):
+        return f"<syrup.Session {self.operation.name}>"
+
+
+def _arguments(name, image, min_confidence, max_results, region):
+    pixels, width, height, channels = _pixels(image)
+    if region is not None:
+        region = _ints(region, 4, "region must be four non-negative ints (x, y, w, h)", name)
+    if max_results is not None:
+        (max_results,) = _ints([max_results], 1, "max_results must be a non-negative int", name)
+    return pixels, width, height, channels, min_confidence, max_results, region
 
 
 def resolve(name):

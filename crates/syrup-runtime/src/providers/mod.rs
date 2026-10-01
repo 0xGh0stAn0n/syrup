@@ -1,5 +1,6 @@
 //! Capabilities the host offers generated modules.
 
+pub mod motion;
 pub mod tesseract;
 #[cfg(feature = "face-yunet")]
 pub mod yunet;
@@ -105,6 +106,12 @@ impl Providers {
         match capability {
             Capability::FaceDetection => Ok(self.face.clone()),
             Capability::TextRecognition => Ok(self.text.clone()),
+            Capability::Motion => Err(SyrupError::new(
+                Stage::Execute,
+                ErrorKind::BadParameter,
+                "moving regions are found between frames, so only sessions find them",
+            )
+            .with_hint("op.session(), then call it with each frame")),
             Capability::Custom(name) => custom::provider(name).ok_or_else(|| {
                 SyrupError::new(
                     Stage::Execute,

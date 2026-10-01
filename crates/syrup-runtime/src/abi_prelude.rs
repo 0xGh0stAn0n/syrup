@@ -17,6 +17,7 @@ pub const SYRUP_ERR_EMIT: i32 = 5;
 
 pub const SYRUP_CAP_FACE: u32 = 1;
 pub const SYRUP_CAP_TEXT: u32 = 2;
+pub const SYRUP_CAP_MOTION: u32 = 3;
 
 pub const SYRUP_MEASURE_SHARPNESS: u32 = 1;
 pub const SYRUP_MEASURE_FILL: u32 = 2;

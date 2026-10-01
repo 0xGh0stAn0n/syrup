@@ -38,8 +38,8 @@ mod validate;
 
 pub use cache::{BundleIndex, Manifest, Store};
 pub use contract::{
-    ArtifactStatus, BoxF, FindResult, Found, ImageInput, Keypoint, OwnedImage, RunParams,
+    ArtifactStatus, BoxF, FindResult, Found, ImageInput, Keypoint, OwnedImage, RunParams, TrackRef,
 };
 pub use error::{ErrorKind, Result, Stage, SyrupError};
 pub use intent::{Intent, NormRect, OrderKey, PixelRect, Ratio, RegionSpec};
-pub use runtime::{Config, Mode, Operation, Prepared, Runtime};
+pub use runtime::{Config, Mode, Operation, Prepared, Runtime, Session, SessionOptions};

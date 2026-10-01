@@ -19,14 +19,16 @@ an ordinary `NameError`; Python has no honest hook for that.
 ## 2. Grammar (v1)
 
 ```text
-name      := find_name | measure_name
+name      := find_name | measure_name | track_name
 find_name := verb "_" body
+track_name := "track_" body
 body      := [count "_" selector "_" | selector "_" | "all_"] [colour "_"] target ("_" clause)*
 measure_name := "measure_" quantity ["_of_" body | "_in_" region]
 quantity  := sharpness | fill
 verb      := find | detect | locate
 target    := face | faces | human_face | human_faces | word | words
            | region | regions | blob | blobs | bar | bars
+           | moving_region | moving_regions | moving_blob | moving_blobs
 colour    := red | orange | yellow | green | cyan | blue | purple | violet | magenta
 selector  := largest | biggest | smallest | leftmost | rightmost | topmost | bottommost | most_confident
 count     := 1..100, or one..ten
@@ -78,6 +80,32 @@ detector leaves out what it does not accept.
 `fill` is measured on bars only, and needs their colour
 (`measure_fill_of_red_bars`).
 
+`track_*` operations follow items across the frames of a session:
+
+```python
+session = syrup.ops.track_faces.session()      # max_distance=48, grace_frames=5
+for frame in frames:
+    for face in session(frame):
+        print(face.track.id, face.track.velocity)
+```
+
+Each frame goes through the same compiled module as the matching `find_*`
+(`track_faces` and `find_faces` share one artifact); the session then gives
+each item the id the core's tracker matched it to: the nearest box centre
+within `max_distance` pixels of where the object was heading. An object
+unseen for up to `grace_frames` frames keeps its id when it comes back, but
+frames report only what was seen in them. Calling a `track_*` operation
+without a session, or making a session for any other operation, is an
+`InputError`.
+
+Moving regions are what changed since the session's previous frame, by the
+core's frame differencing: pixels whose difference crosses the threshold,
+grouped into regions of at least 24 pixels, scored by the share of the box
+that changed. A moving object shows up as the area it left and the area it
+entered, and nothing moves in a session's first frame. They exist only in
+sessions (`find_moving_regions` is refused), and changing the session's
+`region` starts the comparison over.
+
 Singular and plural mean the same: `find_face` returns every face, so
 `faces = find_face(img)` reads right. One result is spelled with a selector:
 `find_largest_face`. Names that differ only by synonym, number or clause
@@ -111,6 +139,9 @@ to one item.
   `left_mouth_corner` (the subject's right and left).
 - `value`: the measured quantity for `measure_*` operations, otherwise
   empty.
+- `track`: for `track_*` sessions, `id` (stable while the object stays in
+  view), `age_frames` and `velocity` (box centre movement since the
+  previous frame, in pixels); otherwise empty.
 - `text`: what a word says; empty for targets that do not read text. A
   word's confidence is Tesseract's, divided by 100. A region's or bar's is
   the share of its box's pixels that have the colour.

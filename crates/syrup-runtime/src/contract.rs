@@ -208,6 +208,18 @@ pub struct Found {
     pub text: Option<String>,
     /// The measured quantity, in [0, 1], for `measure_*` operations.
     pub value: Option<f32>,
+    /// The item's identity across a session's frames, for `track_*` operations.
+    pub track: Option<TrackRef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct TrackRef {
+    /// The same object keeps its id from frame to frame within a session.
+    pub id: u64,
+    /// Frames this track has been seen in, this one included.
+    pub age_frames: u32,
+    /// Movement of the box centre since the previous frame, in pixels.
+    pub velocity: (f32, f32),
 }
 
 /// How a run got its compiled module.
@@ -256,6 +268,8 @@ pub struct Provenance {
     pub image: (u32, u32, u32),
     pub prepare_ms: f64,
     pub execute_ms: f64,
+    /// The frame's number in its session, from 1.
+    pub frame: Option<u64>,
 }
 
 /// Empty means the operation ran and accepted nothing. Failures are errors.

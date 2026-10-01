@@ -65,10 +65,14 @@ from syrup.ops import find_face        Runtime::resolve("find_face")
    compiles on first call. A bare name that was never imported cannot be
    intercepted honestly, so it is not attempted. Names outside the grammar
    go through `syrup.define`.
-6. **New detectors plug in without Rust.** `syrup.add_target(noun, detect)`
+6. **State lives in sessions, not modules.** A generated module looks at one
+   frame. `track_*` sessions run it per frame and keep what spans frames in
+   the host: the core's tracker, and for moving regions the previous frame,
+   served to the module as a capability like any detector.
+7. **New detectors plug in without Rust.** `syrup.add_target(noun, detect)`
    registers a Python function (any ML library) as a provider; names using
    the noun compile to modules that call it through the same ABI.
-7. **The model is a pinned dependency of the runtime.** YuNet 2023mar (MIT,
+8. **The model is a pinned dependency of the runtime.** YuNet 2023mar (MIT,
    232 KB, SHA-256 checked) runs through `tract-onnx`: pure Rust, no OpenCV.
    The core crate stays model-free.
 
@@ -79,5 +83,7 @@ from syrup.ops import find_face        Runtime::resolve("find_face")
 2. Migrate the existing core: OCR gets explicit errors and image-coordinate
    word boxes; existing primitives become catalog capabilities; old entry
    points stay as marked adapters.
-3. Later: prepared bundles, more platforms and providers, video sessions,
-   and an optional language-model planner that may only emit typed plans.
+3. Measurements, sessions for motion and tracking, prepared bundles, wheels
+   for Linux, macOS and Windows.
+4. Later: more providers, and an optional language-model planner that may
+   only emit typed plans.

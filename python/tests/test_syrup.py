@@ -223,3 +223,18 @@ def test_measurements_carry_a_value():
     with pytest.raises(syrup.IntentError) as e:
         syrup.ops.measure_fill_of_faces
     assert e.value.kind == "unsupported"
+
+
+def test_sessions_follow_objects_across_frames():
+    session = syrup.ops.track_largest_face.session()
+    photo = PILImage.open(ASTRONAUT)
+    tracks = []
+    for step in range(3):
+        (face,) = session(photo.crop((8 * step, 0, 8 * step + 400, 400)))
+        tracks.append(face.track)
+    assert len({t.id for t in tracks}) == 1
+    assert abs(tracks[-1].velocity[0] + 8) < 2
+    with pytest.raises(syrup.InputError):
+        syrup.ops.track_faces(photo)
+    with pytest.raises(syrup.InputError):
+        syrup.ops.find_faces.session()

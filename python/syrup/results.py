@@ -16,6 +16,16 @@ class Box:
 
 
 @dataclass(frozen=True)
+class Track:
+    """An object's identity across a session's frames."""
+
+    id: int
+    age_frames: int
+    # Movement of the box centre since the previous frame, in pixels.
+    velocity: tuple[float, float]
+
+
+@dataclass(frozen=True)
 class Found:
     label: str
     box: Box
@@ -26,6 +36,8 @@ class Found:
     text: str | None = None
     # The measured quantity in [0, 1], for measure_* operations.
     value: float | None = None
+    # Set by track_* sessions.
+    track: Track | None = None
 
 
 @dataclass(frozen=True)
@@ -41,6 +53,8 @@ class Provenance:
     image: tuple
     prepare_ms: float
     execute_ms: float
+    # The frame's number in its session, from 1.
+    frame: int | None = None
 
 
 class FindResult(Sequence):
@@ -71,6 +85,7 @@ def from_json(text):
             {k["name"]: (k["x"], k["y"]) for k in f["keypoints"]},
             f["text"],
             f["value"],
+            Track(f["track"]["id"], f["track"]["age_frames"], tuple(f["track"]["velocity"])) if f["track"] else None,
         )
         for f in data["items"]
     ]

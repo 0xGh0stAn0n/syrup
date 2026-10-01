@@ -2,7 +2,7 @@
 //! bound one by one: Python passes a name and pixels, and gets JSON back.
 
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
@@ -16,7 +16,7 @@ use syrup_runtime::intent::region_named;
 use syrup_runtime::providers::{Detections, Provider, ViewRef};
 use syrup_runtime::{
     ErrorKind, ImageInput, Intent, NormRect, Operation, OrderKey, OwnedImage, PixelRect, Ratio,
-    RegionSpec, RunParams, Runtime, Stage, SyrupError, catalog,
+    RegionSpec, RunParams, Runtime, Session, SessionOptions, Stage, SyrupError, catalog,
 };
 
 create_exception!(_native, NativeError, PyException);
@@ -86,6 +86,21 @@ impl NativeOperation {
         .to_string())
     }
 
+    #[pyo3(signature = (max_distance=None, grace_frames=None))]
+    fn session(
+        &self,
+        max_distance: Option<f32>,
+        grace_frames: Option<u32>,
+    ) -> PyResult<NativeSession> {
+        let defaults = SessionOptions::default();
+        let options = SessionOptions {
+            max_distance: max_distance.unwrap_or(defaults.max_distance),
+            grace_frames: grace_frames.unwrap_or(defaults.grace_frames),
+        };
+        let session = self.0.session(options).map_err(raise)?;
+        Ok(NativeSession(Mutex::new(session)))
+    }
+
     #[pyo3(signature = (pixels, width, height, channels, min_confidence=None, max_results=None, region=None))]
     #[allow(clippy::too_many_arguments)]
     fn run(
@@ -108,6 +123,40 @@ impl NativeOperation {
             .detach(|| {
                 let image = ImageInput::new(&pixels, width, height, channels)?;
                 self.0.run(&image, &params)
+            })
+            .map_err(raise)?;
+        Ok(serde_json::to_string(&result).expect("results serialize"))
+    }
+}
+
+#[pyclass(frozen, module = "syrup._native")]
+struct NativeSession(Mutex<Session>);
+
+#[pymethods]
+impl NativeSession {
+    #[pyo3(signature = (pixels, width, height, channels, min_confidence=None, max_results=None, region=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn update(
+        &self,
+        py: Python<'_>,
+        pixels: PyBackedBytes,
+        width: u32,
+        height: u32,
+        channels: u32,
+        min_confidence: Option<f32>,
+        max_results: Option<u32>,
+        region: Option<(u32, u32, u32, u32)>,
+    ) -> PyResult<String> {
+        let params = RunParams {
+            min_confidence,
+            max_results,
+            region: region.map(|(x, y, w, h)| PixelRect { x, y, w, h }),
+        };
+        let result = py
+            .detach(|| {
+                let image = ImageInput::new(&pixels, width, height, channels)?;
+                let mut session = self.0.lock().unwrap_or_else(|e| e.into_inner());
+                session.update(&image, &params)
             })
             .map_err(raise)?;
         Ok(serde_json::to_string(&result).expect("results serialize"))
@@ -198,6 +247,7 @@ fn intent_from(spec: Spec) -> Result<Intent, SyrupError> {
         min_area_pct: spec.min_area_pct,
         max_area_pct: spec.max_area_pct,
         measure,
+        track: false,
     })
 }
 
@@ -310,6 +360,7 @@ fn cache_dir() -> PyResult<PathBuf> {
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("NativeError", m.py().get_type::<NativeError>())?;
     m.add_class::<NativeOperation>()?;
+    m.add_class::<NativeSession>()?;
     m.add_function(wrap_pyfunction!(resolve, m)?)?;
     m.add_function(wrap_pyfunction!(define, m)?)?;
     m.add_function(wrap_pyfunction!(add_target, m)?)?;
