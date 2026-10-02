@@ -38,20 +38,26 @@ an ordinary `NameError`; Python has no honest hook for that.
 name      := find_name | measure_name | track_name
 find_name := verb "_" body
 track_name := "track_" body
-body      := [count "_" selector "_" | selector "_" | "all_"] [colour "_"] target ("_" clause)*
+body      := [count "_" selector "_" | selector "_" | quantifier "_"] ["the_"] [colour "_"] target ("_" clause)*
 measure_name := "measure_" quantity ["_of_" body | "_in_" region]
 quantity  := sharpness | fill
-verb      := find | detect | locate
+verb      := find | detect | locate | get | list | extract | spot | search
+           | read | decode                                    (words and QR codes only)
+quantifier := all | every | each | any
 target    := face | faces | human_face | human_faces | word | words
-           | region | regions | blob | blobs | bar | bars
-           | qr_code | qr_codes | text_block | text_blocks | panel | panels
+           | region | regions | blob | blobs | area | areas | bar | bars
+           | qr_code | qr_codes | qrcode | qrcodes | qr | qrs
+           | text_block | text_blocks | panel | panels
            | moving_region | moving_regions | moving_blob | moving_blobs
+           | moving_object | moving_objects | motion | movement
 colour    := red | orange | yellow | green | cyan | blue | purple | violet | magenta
 selector  := largest | biggest | smallest | leftmost | rightmost | topmost | bottommost | most_confident
 count     := 1..100, or one..ten
-clause    := in_<region> | by_size | by_area | by_confidence | by_score
-           | left_to_right | right_to_left | top_to_bottom | bottom_to_top
-           | larger_than_<n>pct | smaller_than_<n>pct        (n = 1..100, % of image area)
+clause    := (in | at | on)_[the_]<region> | [sorted_ | ordered_]by_(size | area | confidence | score)
+           | [from_](left_to_right | right_to_left | top_to_bottom | bottom_to_top)
+           | (largest | biggest | smallest | most_confident)_first
+           | (larger_than | bigger_than | over)_<n>pct | (smaller_than | under)_<n>pct   (n = 1..100, % of image area)
+           | in_image | in_frame | on_screen                (the whole image, which is the default)
 region    := top_half | bottom_half | left_half | right_half
            | top_left | top_right | bottom_left | bottom_right
            | top_third | bottom_third | left_third | right_third | center | region
@@ -126,9 +132,10 @@ without a session, or making a session for any other operation, is an
 
 Moving regions are what changed since the session's previous frame, by the
 core's frame differencing: pixels whose difference crosses the threshold,
-grouped into regions of at least 24 pixels, scored by the share of the box
-that changed. A moving object shows up as the area it left and the area it
-entered, and nothing moves in a session's first frame. They exist only in
+with changes up to 12 pixels apart joined into one region of at least 24
+pixels, scored by the share of the box that changed. A moving object is one
+region, or the area it left and the area it entered when those are further
+apart, and nothing moves in a session's first frame. They exist only in
 sessions (`find_moving_regions` is refused), and changing the session's
 `region` starts the comparison over. A frame that fails leaves the session
 as it was.

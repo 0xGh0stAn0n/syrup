@@ -139,7 +139,7 @@ fn a_failed_frame_leaves_the_session_as_it_was() {
             .is_err()
     );
     // ...and the next good frame still compares with the first one.
-    let moved = square_at(40);
+    let moved = square_at(70);
     let result = session
         .update(&ImageInput::from_rgba(&moved), &region(0, 0))
         .unwrap();

@@ -78,7 +78,7 @@ fn shareable() -> Result<Retained<SCShareableContent>, CaptureError> {
     });
     unsafe {
         SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
-            true, true, &handler,
+            true, false, &handler,
         );
     }
     match receive.recv_timeout(REPLY).map_err(|_| no_reply())?.0 {
@@ -88,17 +88,20 @@ fn shareable() -> Result<Retained<SCShareableContent>, CaptureError> {
     }
 }
 
-/// Every on-screen window with a title.
+/// Every titled application window, on-screen ones first: a window on
+/// another Space, or behind a full-screen app, is still found by title.
 fn windows() -> Result<Vec<(String, Retained<SCWindow>)>, CaptureError> {
     let content = shareable()?;
-    let windows = unsafe { content.windows() };
-    Ok(windows
+    let mut windows: Vec<_> = unsafe { content.windows() }
         .iter()
+        .filter(|window| unsafe { window.windowLayer() } == 0)
         .filter_map(|window| {
             let title = unsafe { window.title() }?.to_string();
             (!title.is_empty()).then_some((title, window))
         })
-        .collect())
+        .collect();
+    windows.sort_by_key(|(_, window)| !unsafe { window.isOnScreen() });
+    Ok(windows)
 }
 
 pub fn list_windows() -> Result<Vec<String>, CaptureError> {
@@ -134,10 +137,20 @@ impl Window {
         // The window's current size, in pixels.
         let info = unsafe { SCShareableContent::infoForFilter(&self.filter) };
         let (rect, scale) = unsafe { (info.contentRect(), info.pointPixelScale() as f64) };
+        let scale = scale.max(1.0);
+        let (width, height) = (
+            (rect.size.width * scale).round() as usize,
+            (rect.size.height * scale).round() as usize,
+        );
+        if width == 0 || height == 0 {
+            return Err(CaptureError::Failed(
+                "the window has no size; is it minimised?".into(),
+            ));
+        }
         let config = unsafe { SCStreamConfiguration::new() };
         unsafe {
-            config.setWidth((rect.size.width * scale).round() as usize);
-            config.setHeight((rect.size.height * scale).round() as usize);
+            config.setWidth(width);
+            config.setHeight(height);
             config.setShowsCursor(false);
             config.setIgnoreShadowsSingleWindow(true);
         }

@@ -271,8 +271,8 @@ pub const TARGETS: &[TargetEntry] = &[
     TargetEntry {
         target: Target::Region,
         label: "region",
-        singular: &["region", "blob"],
-        plural: &["regions", "blobs"],
+        singular: &["region", "blob", "area"],
+        plural: &["regions", "blobs", "areas"],
         finder: Finder::Color {
             min_run: 3,
             min_height: 3,
@@ -303,8 +303,8 @@ pub const TARGETS: &[TargetEntry] = &[
     TargetEntry {
         target: Target::QrCode,
         label: "qr_code",
-        singular: &["qr_code"],
-        plural: &["qr_codes"],
+        singular: &["qr_code", "qrcode", "qr"],
+        plural: &["qr_codes", "qrcodes", "qrs"],
         finder: Finder::Detect(Capability::QrDecoding),
         // Decoded codes score 1; unreadable ones 0.5.
         default_min_confidence: 0.6,
@@ -337,8 +337,14 @@ pub const TARGETS: &[TargetEntry] = &[
     TargetEntry {
         target: Target::MovingRegion,
         label: "moving_region",
-        singular: &["moving_region", "moving_blob"],
-        plural: &["moving_regions", "moving_blobs"],
+        singular: &[
+            "moving_region",
+            "moving_blob",
+            "moving_object",
+            "motion",
+            "movement",
+        ],
+        plural: &["moving_regions", "moving_blobs", "moving_objects"],
         finder: Finder::Detect(Capability::Motion),
         // Confidence is the share of the box's pixels that changed.
         default_min_confidence: 0.0,

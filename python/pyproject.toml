@@ -20,7 +20,7 @@ classifiers = [
 test = ["pytest", "numpy", "pillow"]
 planner = ["anthropic"]
 yolo = ["numpy", "ultralytics"]
-mediapipe = ["numpy", "mediapipe"]
+mediapipe = ["numpy", "mediapipe>=0.10.30,<1.0"]  # 1.0.1 aborts on macOS arm64 (Metal)
 
 [tool.maturin]
 manifest-path = "../crates/syrup-python/Cargo.toml"

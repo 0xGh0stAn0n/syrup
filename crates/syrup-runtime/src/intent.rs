@@ -360,18 +360,22 @@ impl fmt::Display for Intent {
     }
 }
 
-const FIND_VERBS: &[&str] = &["find", "detect", "locate"];
+const FIND_VERBS: &[&str] = &[
+    "find", "detect", "locate", "get", "list", "extract", "spot", "search",
+];
+
+// Find verbs that only make sense for targets carrying text.
+const READ_VERBS: &[&str] = &["read", "decode"];
 
 const OTHER_VERBS: &[(&str, &str)] = &[
     ("count", "use len(find_...) for now"),
-    ("read", "reading text is not in the catalog yet"),
     (
         "recognize",
         "Syrup locates things, it does not recognise identities",
     ),
     (
         "identify",
-        "Syrup locates things, it does not identify people",
+        "Syrup locates things, it does not identify them",
     ),
     ("classify", "classification is not in the catalog yet"),
     ("segment", "segmentation is not in the catalog yet"),
@@ -499,6 +503,10 @@ const AMBIGUOUS_WORDS: &[(&str, &str)] = &[
     ("several", "how many? Say e.g. find_3_largest_faces"),
     ("few", "how many? Say e.g. find_3_largest_faces"),
     (
+        "text",
+        "as words read one by one (find_words) or as one block (find_text_blocks)?",
+    ),
+    (
         "middle",
         "horizontally or vertically? Say center for the middle of both",
     ),
@@ -585,9 +593,11 @@ pub fn region_named(name: &str) -> Option<RegionSpec> {
 /// run time may not use it in its noun.
 pub fn is_reserved(word: &str) -> bool {
     const KEYWORDS: &[&str] = &[
-        "all", "in", "by", "than", "to", "pct", "percent", "larger", "bigger", "smaller",
+        "all", "every", "each", "any", "the", "in", "on", "at", "by", "from", "sorted", "ordered",
+        "first", "over", "under", "than", "to", "pct", "percent", "larger", "bigger", "smaller",
     ];
     FIND_VERBS.contains(&word)
+        || READ_VERBS.contains(&word)
         || ["measure", "track", "of", "moving"].contains(&word)
         || Quantity::named(word).is_some()
         || OTHER_VERBS.iter().any(|(verb, _)| *verb == word)
@@ -726,17 +736,14 @@ impl<'a> Parser<'a> {
         {
             self.error(
                 ErrorKind::Ambiguous,
-                format!("in_{word} does not say how much of the image"),
+                format!("{word} does not say how much of the image"),
             )
         } else if let Some((_, why)) = AMBIGUOUS_WORDS.iter().find(|(w, _)| *w == word) {
-            self.error(
-                ErrorKind::Ambiguous,
-                format!("in_{word} is ambiguous: {why}"),
-            )
+            self.error(ErrorKind::Ambiguous, format!("{word} is ambiguous: {why}"))
         } else {
             self.error(
                 ErrorKind::Unsupported,
-                format!("in_{word} is not a region Syrup knows"),
+                format!("{word} is not a region Syrup knows"),
             )
         };
         Err(error.with_hint(grammar_summary()))
@@ -785,6 +792,17 @@ pub fn parse(name: &str) -> Result<Intent> {
         ));
     } else if FIND_VERBS.contains(&verb) {
         find_body(&mut p)?
+    } else if READ_VERBS.contains(&verb) {
+        let intent = find_body(&mut p)?;
+        if !matches!(intent.target, Target::Word | Target::QrCode) {
+            return Err(p
+                .error(
+                    ErrorKind::Unsupported,
+                    format!("{verb} needs something that carries text"),
+                )
+                .with_hint(format!("{verb}_words or {verb}_qr_codes")));
+        }
+        intent
     } else {
         return Err(malformed(&p, format!("{verb} is not a verb Syrup knows")));
     };
@@ -852,8 +870,11 @@ fn find_body(p: &mut Parser) -> Result<Intent> {
             }
             continue;
         }
-        if p.eat(&["all"]) {
+        if ["all", "every", "each", "any"].iter().any(|w| p.eat(&[w])) {
             all = true;
+            continue;
+        }
+        if p.eat(&["the"]) {
             continue;
         }
         let word = p.peek();
@@ -887,14 +908,12 @@ fn find_body(p: &mut Parser) -> Result<Intent> {
         let reason = if target_later {
             format!("{word} is not a word Syrup understands, and unknown words are not dropped")
         } else {
-            format!(
-                "nothing in the catalog finds {}",
-                p.tokens[p.pos..].join("_")
-            )
+            format!("nothing in the catalog finds {word}")
         };
-        return Err(p
-            .error(ErrorKind::Unsupported, reason)
-            .with_hint(format!("known targets: {}", catalog::known_targets())));
+        return Err(p.error(ErrorKind::Unsupported, reason).with_hint(format!(
+            "known targets: {}; syrup.add_target or syrup.recipes add more",
+            catalog::known_targets()
+        )));
     };
 
     let mut intent = Intent::find(target);
@@ -945,7 +964,49 @@ fn find_body(p: &mut Parser) -> Result<Intent> {
 fn clauses<'a>(p: &mut Parser<'a>, intent: &mut Intent) -> Result<Option<&'a str>> {
     let mut order_clause: Option<&'a str> = None;
     while p.pos < p.tokens.len() {
-        if p.eat(&["in"]) {
+        // The whole image is what is searched anyway.
+        if [
+            "in_image",
+            "in_the_image",
+            "in_frame",
+            "in_the_frame",
+            "on_screen",
+            "on_the_screen",
+        ]
+        .iter()
+        .any(|phrase| p.eat_phrase(phrase))
+        {
+            continue;
+        }
+        if p.at(&["from"])
+            && DIRECTIONS
+                .iter()
+                .any(|(words, _)| p.tokens.get(p.pos + 1..p.pos + 1 + words.len()) == Some(words))
+        {
+            p.pos += 1;
+            continue;
+        }
+        if p.eat(&["sorted"]) || p.eat(&["ordered"]) {
+            if !p.at(&["by"]) {
+                return Err(p
+                    .error(ErrorKind::Ambiguous, "sorted by what?")
+                    .with_hint("by_size, by_confidence, left_to_right, top_to_bottom, ..."));
+            }
+            continue;
+        }
+        if let Some((words, key)) = SELECTORS
+            .iter()
+            .find(|(words, _)| p.at(words) && p.tokens.get(p.pos + words.len()) == Some(&"first"))
+        {
+            p.pos += words.len() + 1;
+            if order_clause.replace(words[0]).is_some() {
+                return Err(p.error(ErrorKind::Conflicting, "more than one ordering"));
+            }
+            intent.order = *key;
+            continue;
+        }
+        if p.eat(&["in"]) || p.eat(&["at"]) || p.eat(&["on"]) {
+            p.eat(&["the"]);
             if intent.region.is_some() {
                 return Err(p.error(ErrorKind::Conflicting, "more than one region"));
             }
@@ -973,7 +1034,12 @@ fn clauses<'a>(p: &mut Parser<'a>, intent: &mut Intent) -> Result<Option<&'a str
                 return Err(p.error(ErrorKind::Conflicting, "more than one ordering"));
             }
             intent.order = *key;
-        } else if p.eat(&["larger", "than"]) || p.eat(&["bigger", "than"]) {
+        } else if p.eat(&["larger", "than"])
+            || p.eat(&["bigger", "than"])
+            || (p.at(&["over"])
+                && p.tokens.get(p.pos + 1).is_some_and(|t| t.ends_with("pct"))
+                && p.eat(&["over"]))
+        {
             if intent
                 .min_area_pct
                 .replace(p.percent("larger_than")?)
@@ -981,7 +1047,11 @@ fn clauses<'a>(p: &mut Parser<'a>, intent: &mut Intent) -> Result<Option<&'a str
             {
                 return Err(p.error(ErrorKind::Conflicting, "more than one larger_than"));
             }
-        } else if p.eat(&["smaller", "than"]) {
+        } else if p.eat(&["smaller", "than"])
+            || (p.at(&["under"])
+                && p.tokens.get(p.pos + 1).is_some_and(|t| t.ends_with("pct"))
+                && p.eat(&["under"]))
+        {
             if intent
                 .max_area_pct
                 .replace(p.percent("smaller_than")?)
@@ -1036,6 +1106,41 @@ mod tests {
             ok("find_faces_in_center_by_size"),
             ok("find_faces_by_size_in_centre")
         );
+    }
+
+    #[test]
+    fn everyday_phrasings_mean_what_they_say() {
+        for (name, same_as) in [
+            ("get_every_face", "find_faces"),
+            ("list_the_faces_in_image", "find_faces"),
+            ("extract_faces_on_screen", "find_faces"),
+            ("spot_faces_sorted_by_size", "find_faces_by_size"),
+            ("search_faces_largest_first", "find_faces_by_size"),
+            ("find_words_from_left_to_right", "find_words_left_to_right"),
+            ("find_faces_in_the_center", "find_faces_in_center"),
+            ("find_faces_on_the_left_half", "find_faces_in_left_half"),
+            ("read_words", "find_words"),
+            ("decode_qr_codes", "find_qr_codes"),
+            ("find_qr", "find_qr_codes"),
+            ("find_red_areas", "find_red_regions"),
+            ("track_motion", "track_moving_regions"),
+            ("track_moving_objects", "track_moving_regions"),
+            ("find_faces_over_10pct", "find_faces_larger_than_10pct"),
+            ("find_faces_under_5pct", "find_faces_smaller_than_5pct"),
+        ] {
+            assert_eq!(ok(name), ok(same_as), "{name}");
+        }
+        assert_eq!(ok("find_faces_smallest_first").order, OrderKey::AreaAsc);
+        for (name, expected) in [
+            ("find_text", ErrorKind::Ambiguous),
+            ("read_text", ErrorKind::Ambiguous),
+            ("read_faces", ErrorKind::Unsupported),
+            ("find_faces_sorted", ErrorKind::Ambiguous),
+            ("find_faces_at_the_top", ErrorKind::Ambiguous),
+            ("find_a_face", ErrorKind::Unsupported),
+        ] {
+            assert_eq!(kind(name), expected, "{name}");
+        }
     }
 
     #[test]

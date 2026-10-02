@@ -47,6 +47,9 @@ pub struct MotionConfig {
     pub min_blob_height: u32,
     /// Minimum blob area, in pixels, to keep a candidate (rejects noise).
     pub min_blob_area: u32,
+    /// Changed areas at most this many pixels apart form one blob, so a
+    /// walking person's limbs and edges are one region rather than many.
+    pub merge_distance: u32,
     /// Maximum matching distance (pixels) for the object tracker.
     pub track_match_distance: f32,
     /// How many consecutive missed frames a track survives (occlusion grace).
@@ -60,6 +63,7 @@ impl Default for MotionConfig {
             min_run_width: 4,
             min_blob_height: 4,
             min_blob_area: 24,
+            merge_distance: 12,
             track_match_distance: 48.0,
             track_grace_frames: 5,
         }
@@ -211,38 +215,113 @@ fn changed_fraction(mask: &GrayImage) -> f32 {
     moved_pixels as f32 / total_pixels
 }
 
-/// Changed regions of a motion mask: runs of at least `min_run_width`
-/// grouped into blobs at least `min_blob_height` rows tall and
+/// Changed regions of a motion mask: changed pixels at most
+/// `merge_distance` apart are joined, then runs of at least `min_run_width`
+/// are grouped into blobs at least `min_blob_height` rows tall and
 /// `min_blob_area` pixels large.
 pub fn extract_blobs(mask: &GrayImage, config: &MotionConfig) -> Vec<Rect> {
     let (width, height) = mask.dimensions();
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    let reach = config.merge_distance / 2;
+    let joined = dilate(mask, reach);
     let mut rows = Vec::new();
-    for y in 0..height {
+    for (y, row) in (0..height).zip(joined.as_raw().chunks_exact(width as usize)) {
         let mut start: Option<u32> = None;
-        for x in 0..width {
-            let moved = mask.get_pixel(x, y).0[0] > 0;
-            if moved {
+        for (x, &value) in (0..width).zip(row) {
+            if value > 0 {
                 if start.is_none() {
                     start = Some(x);
                 }
             } else if let Some(begin) = start {
-                if x - begin >= config.min_run_width {
-                    rows.push((y, begin, x - 1));
-                }
+                rows.push((y, begin, x - 1));
                 start = None;
             }
         }
-        if let Some(begin) = start
-            && width - begin >= config.min_run_width
-        {
+        if let Some(begin) = start {
             rows.push((y, begin, width - 1));
         }
     }
 
-    group_segments(rows, config.min_blob_height, 1)
+    group_segments(rows, 1, 1)
         .into_iter()
-        .filter(|rect| rect.area() >= config.min_blob_area)
+        .filter_map(|rect| changed_bounds(mask, rect))
+        .filter(|rect| {
+            rect.w >= config.min_run_width
+                && rect.h >= config.min_blob_height
+                && rect.area() >= config.min_blob_area
+        })
         .collect()
+}
+
+/// The bounds of the changed pixels inside `rect`.
+fn changed_bounds(mask: &GrayImage, rect: Rect) -> Option<Rect> {
+    let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
+    for y in rect.y..rect.y + rect.h {
+        for x in rect.x..rect.x + rect.w {
+            if mask.get_pixel(x, y).0[0] > 0 {
+                (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+            }
+        }
+    }
+    (x0 <= x1).then(|| Rect {
+        x: x0,
+        y: y0,
+        w: x1 - x0 + 1,
+        h: y1 - y0 + 1,
+    })
+}
+
+/// The mask with every changed pixel grown into a square `2 * reach + 1`
+/// pixels wide, from sliding counts of changed pixels: along each row, then
+/// down each column.
+fn dilate(mask: &GrayImage, reach: u32) -> GrayImage {
+    if reach == 0 {
+        return mask.clone();
+    }
+    let (width, height) = (mask.width() as usize, mask.height() as usize);
+    let reach = reach as usize;
+    let mut across = vec![0u8; width * height];
+    for (row, out) in mask
+        .as_raw()
+        .chunks_exact(width)
+        .zip(across.chunks_exact_mut(width))
+    {
+        let mut count = row[..reach.min(width)].iter().filter(|&&v| v > 0).count();
+        for x in 0..width {
+            if x + reach < width {
+                count += (row[x + reach] > 0) as usize;
+            }
+            if x > reach {
+                count -= (row[x - reach - 1] > 0) as usize;
+            }
+            out[x] = (count > 0) as u8;
+        }
+    }
+    let mut counts = vec![0u32; width];
+    let add = |counts: &mut [u32], y: usize, sign: i32| {
+        for (count, &set) in counts.iter_mut().zip(&across[y * width..(y + 1) * width]) {
+            *count = count.wrapping_add_signed(sign * set as i32);
+        }
+    };
+    let mut out = GrayImage::new(width as u32, height as u32);
+    for y in 0..reach.min(height) {
+        add(&mut counts, y, 1);
+    }
+    for y in 0..height {
+        if y + reach < height {
+            add(&mut counts, y + reach, 1);
+        }
+        if y > reach {
+            add(&mut counts, y - reach - 1, -1);
+        }
+        let row = &mut out.as_mut()[y * width..(y + 1) * width];
+        for (pixel, &count) in row.iter_mut().zip(&counts) {
+            *pixel = if count > 0 { 255 } else { 0 };
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -268,6 +347,41 @@ mod tests {
         assert!(mask.get_pixel(5, 5).0[0] > 0, "vacated pixels are motion");
         assert!(mask.get_pixel(21, 5).0[0] > 0, "entered pixels are motion");
         assert_eq!(mask.get_pixel(15, 15).0[0], 0, "unchanged pixel is still");
+    }
+
+    #[test]
+    fn nearby_changes_form_one_blob_and_distant_ones_stay_apart() {
+        let mut mask = GrayImage::new(120, 60);
+        let mut fill = |x0: u32, y0: u32, w: u32, h: u32| {
+            for y in y0..y0 + h {
+                for x in x0..x0 + w {
+                    mask.put_pixel(x, y, Luma([255]));
+                }
+            }
+        };
+        // A head and a body 8 pixels apart, and something far to the right.
+        fill(10, 5, 8, 8);
+        fill(8, 21, 12, 30);
+        fill(90, 20, 10, 10);
+        let mut blobs = extract_blobs(&mask, &MotionConfig::default());
+        blobs.sort_by_key(|rect| rect.x);
+        assert_eq!(
+            blobs,
+            [
+                Rect {
+                    x: 8,
+                    y: 5,
+                    w: 12,
+                    h: 46
+                },
+                Rect {
+                    x: 90,
+                    y: 20,
+                    w: 10,
+                    h: 10
+                },
+            ]
+        );
     }
 
     #[test]
