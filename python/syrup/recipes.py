@@ -108,7 +108,7 @@ def _register(labels, detector_for, *, classes, rename, min_confidence, provider
     return added, skipped
 
 
-def yolo(model="yolo11n.pt", *, classes=None, rename=None, min_confidence=0.25):
+def yolo(model="yolo11n.pt", *, classes=None, rename=None, min_confidence=0.5):
     """Every class an Ultralytics YOLO model detects (COCO's 80 for the
     default yolo11n.pt), or only `classes`. `model` is a name from
     YOLO_MODELS or a path to your own weights. Returns (added, skipped):
@@ -167,7 +167,7 @@ EFFICIENTDET_LABELS = [
 ]
 
 
-def mediapipe_objects(*, classes=None, rename=None, min_confidence=0.3):
+def mediapipe_objects(*, classes=None, rename=None, min_confidence=0.5):
     """COCO objects found by MediaPipe's EfficientDet-Lite0 object detector,
     registered like yolo() (same nouns, same return value)."""
     mp, BaseOptions, vision = _mediapipe()
