@@ -12,7 +12,7 @@ use x11rb::protocol::xproto::{
 };
 use x11rb::rust_connection::RustConnection;
 
-use crate::capture::{CaptureError, matches};
+use crate::capture::CaptureError;
 
 pub struct Window {
     conn: RustConnection,
@@ -126,9 +126,7 @@ pub fn list_windows() -> Result<Vec<String>, CaptureError> {
 
 pub fn find(query: &str) -> Result<(String, Window), CaptureError> {
     let (conn, root) = connect()?;
-    let (id, title) = titled(&conn, root)?
-        .into_iter()
-        .find(|(_, title)| matches(title, query))
+    let (id, title) = crate::capture::pick(titled(&conn, root)?, |(_, t)| t, query)
         .ok_or(CaptureError::NotFound)?;
     let composite = conn
         .extension_information(composite::X11_EXTENSION_NAME)?

@@ -292,9 +292,36 @@ fn matches(title: &str, query: &str) -> bool {
     title.to_lowercase().contains(&query.to_lowercase())
 }
 
+/// The window `query` names among `windows` (front to back): the first
+/// whose title is `query` (ignoring case), else the first whose title
+/// contains it. A browser tab "MapleStory Wiki" in front of the game no
+/// longer stands in for the window titled "MapleStory".
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
+fn pick<T>(windows: Vec<T>, title: impl Fn(&T) -> &str, query: &str) -> Option<T> {
+    let exact = windows
+        .iter()
+        .position(|w| title(w).to_lowercase() == query.to_lowercase())
+        .or_else(|| windows.iter().position(|w| matches(title(w), query)))?;
+    windows.into_iter().nth(exact)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_window_titled_exactly_so_wins_over_one_that_contains_it() {
+        let windows = vec!["MapleStory Wiki - Chrome", "MapleStory", "Notes"];
+        assert_eq!(
+            pick(windows.clone(), |t| t, "maplestory"),
+            Some("MapleStory")
+        );
+        assert_eq!(
+            pick(windows.clone(), |t| t, "wiki"),
+            Some("MapleStory Wiki - Chrome")
+        );
+        assert_eq!(pick(windows, |t| t, "calculator"), None);
+    }
 
     /// CI opens a window on each system and names it in SYRUP_TEST_WINDOW
     /// (`.github/open-window.sh`); with `--nocapture` the test says which

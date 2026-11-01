@@ -19,7 +19,7 @@ use objc2_screen_capture_kit::{
     SCContentFilter, SCScreenshotManager, SCShareableContent, SCStreamConfiguration, SCWindow,
 };
 
-use super::{CaptureError, matches};
+use super::CaptureError;
 
 /// The error ScreenCaptureKit reports without the Screen Recording permission.
 const USER_DECLINED: isize = -3801;
@@ -109,10 +109,8 @@ pub fn list_windows() -> Result<Vec<String>, CaptureError> {
 }
 
 pub fn find(query: &str) -> Result<(String, Window), CaptureError> {
-    let (title, window) = windows()?
-        .into_iter()
-        .find(|(title, _)| matches(title, query))
-        .ok_or(CaptureError::NotFound)?;
+    let (title, window) =
+        crate::capture::pick(windows()?, |(t, _)| t, query).ok_or(CaptureError::NotFound)?;
     let filter = unsafe {
         SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), &window)
     };

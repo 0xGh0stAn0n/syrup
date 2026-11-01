@@ -70,7 +70,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{BOOL, Interface};
 
-use super::{CaptureError, FrameSource, Rect, Screen, matches};
+use super::{CaptureError, FrameSource, Rect, Screen};
 
 /// PW_CLIENTONLY | PW_RENDERFULLCONTENT: render just the client area,
 /// and include content drawn outside the classic GDI path.
@@ -143,9 +143,7 @@ pub fn list_windows() -> Result<Vec<String>, CaptureError> {
 }
 
 pub fn find(query: &str) -> Result<(String, Window), CaptureError> {
-    windows()
-        .into_iter()
-        .find(|(_, title)| matches(title, query))
+    crate::capture::pick(windows(), |(_, t)| t, query)
         .map(|(hwnd, title)| {
             (
                 title,
