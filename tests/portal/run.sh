@@ -19,7 +19,7 @@ eval "$(dbus-launch --sh-syntax)"
 pids="$DBUS_SESSION_BUS_PID"
 
 wait_for() {
-    for _ in $(seq 50); do
+    for _ in $(seq 100); do
         if eval "$1" >/dev/null 2>&1; then return 0; fi
         sleep 0.1
     done
@@ -36,8 +36,10 @@ gst-launch-1.0 -q videotestsrc pattern=solid-color foreground-color=0xff20c040 i
     ! pipewiresink mode=provide stream-properties="p,media.class=Video/Source,node.name=syrup-shared-window" &
 source=$!
 pids="$pids $source"
+# The node's id: the last `id N,` line before its name, however many
+# properties come between (more in newer PipeWire).
 node() {
-    pw-cli ls Node | grep -B4 'node.name = "syrup-shared-window"' | sed -n 's/^\s*id \([0-9]*\),.*/\1/p'
+    pw-cli ls Node | awk '$1 == "id" { id = $2 } /node.name = "syrup-shared-window"/ { sub(",", "", id); print id; exit }'
 }
 wait_for 'test -n "$(node)"'
 
