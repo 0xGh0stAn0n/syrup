@@ -32,10 +32,21 @@ try {
   await page.goto("http://127.0.0.1:8792/index.html");
   await page.waitForFunction(() => /Visual models here: en/.test(document.querySelector("#languages").textContent), null, { timeout: 10000 });
   assert(true, "the page shows the service's honest language table");
+  // The job's id, to show what was found when the count is off.
+  let jobId;
+  page.on("response", async (r) => {
+    if (r.request().method() === "POST" && r.url().endsWith("/jobs")) jobId = (await r.json().catch(() => ({}))).id;
+  });
   await page.setInputFiles("#file", webm);
   await page.click("button.primary");
   await page.waitForFunction(() => /people/.test(document.querySelector("#status").textContent), null, { timeout: 180000 });
   const status = await page.$eval("#status", (e) => e.textContent);
+  if (!/2 people, 2 segments/.test(status) && jobId) {
+    const job = await (await fetch(`http://127.0.0.1:8765/jobs/${jobId}`)).json();
+    for (const { keyframes = [], ...track } of job.result?.tracks ?? []) {
+      console.log("track", JSON.stringify({ ...track, keyframes: keyframes.length, first: keyframes[0]?.box }));
+    }
+  }
   assert(/2 people, 2 segments/.test(status) && /on this machine/.test(status), `status: ${status}`);
   const lanes = await page.$$eval(".lane", (els) => els.length);
   assert(lanes === 2, "a timeline lane per person");
