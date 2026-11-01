@@ -7,15 +7,19 @@
         print(face.box, face.confidence)
 
 The name is parsed into an intent, compiled to a native module the first
-time it runs, and reused afterwards. See docs/contract.md for the grammar,
-the result contract and every way an operation can fail.
+time it runs, and reused afterwards. See crates/syrup-runtime/docs/contract.md
+for the grammar, the result contract and every way an operation can fail.
+
+`syrup.find_face` and other names on the package itself are the core
+library's in-process intents (`syrup.legacy`), kept for existing code; they
+need only the core library (`cargo build --release`), not this package's
+compiled extension.
 """
 
 import json
 import operator
 import os
 
-from . import _native
 from .errors import (
     BuildError,
     DependencyError,
@@ -30,10 +34,43 @@ from .errors import (
 )
 from .results import Box, FindResult, Found, Provenance, Track, from_json
 
+
+class _NativeMissing:
+    """Stands in for the compiled extension in a checkout where it was not
+    built: the in-process intents still work, and every use of the compiled
+    operations says how to get them."""
+
+    class NativeError(Exception):
+        pass
+
+    def __init__(self, error):
+        self._error = error
+
+    def __getattr__(self, name):
+        def missing(*args, **kwargs):
+            raise DependencyError(
+                "load",
+                "missing_dependency",
+                "syrup's compiled extension (syrup._native) is not installed",
+                hint="pip install ./python, or `maturin develop` in python/",
+                details={"import_error": str(self._error)},
+            )
+
+        return missing
+
+
+try:
+    from . import _native
+except ImportError as _error:  # a checkout where only the core library was built
+    _native = _NativeMissing(_error)
+
+from .legacy import Detection, Match, library_path, register_template, version  # noqa: E402
+
 __all__ = [
     "Box",
     "BuildError",
     "DependencyError",
+    "Detection",
     "ExecutionError",
     "FindResult",
     "Found",
@@ -41,6 +78,7 @@ __all__ = [
     "InputError",
     "IntentError",
     "LoadError",
+    "Match",
     "Operation",
     "PlanError",
     "Provenance",
@@ -53,8 +91,12 @@ __all__ = [
     "cache_dir",
     "capture",
     "define",
+    "legacy",
+    "library_path",
     "ops",
+    "register_template",
     "resolve",
+    "version",
 ]
 
 
@@ -259,4 +301,14 @@ def cache_dir():
     return _call(_native.cache_dir)
 
 
-from . import capture, ops  # noqa: E402  (they need the names above)
+from . import capture, legacy, ops  # noqa: E402  (they need the names above)
+
+_LEGACY_VERBS = ("find_", "track_", "count_", "measure_", "read_")
+
+
+def __getattr__(name):
+    """`syrup.find_face` and the like: the core library's in-process intents
+    (syrup.legacy). The compiled operations are `syrup.ops.<name>`."""
+    if name.startswith(_LEGACY_VERBS):
+        return getattr(legacy, name)
+    raise AttributeError(f"module 'syrup' has no attribute {name!r}")

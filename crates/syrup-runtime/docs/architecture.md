@@ -4,23 +4,36 @@ The contract this design serves is in [contract.md](contract.md).
 
 ## Starting point
 
-`main` (upstream `265ade5`) is a ~3,300-line Rust crate of deterministic
-pixel primitives: geometry, colour, motion, tracking, Tesseract OCR,
-sharpness, Windows capture and debug drawing. It has 45 passing tests and no
-bindings, build machinery or models. Its shared result type is
-`Detection<T>`.
+The runtime was written by Eitan in `0xGh0stAn0n/syrup`, starting from
+`main` (`265ade5`): a ~3,300-line crate of deterministic pixel primitives
+(geometry, colour, motion, tracking, Tesseract OCR, sharpness, Windows
+capture, debug drawing) whose shared result type is `Detection<T>`.
 
-Upstream also has two unmerged experiments, `claude/intents` and
-`claude/intents-2`. Their planner is a closed enum whose variants each call a
-handwritten `plans::*` function, and the "generated" crate is a one-line call
-to that function built with cargo. That is the name-to-function mapping this
-work replaces, so it starts from `main`.
+In this repository it sits on top of `claude/intents-2`, whose core adds
+more primitives (cascades, templates, glyphs, components, thresholds, face
+parts, sequences) and its own in-process mechanism, `syrup::intent`: a
+closed vocabulary whose plans call handwritten `plans::*` functions, run
+in-process, with an optional cargo-built shared library that calls the
+same functions. The two coexist:
+
+| | `syrup::intent` (core) | `syrup-runtime` |
+|---|---|---|
+| reached as | `syrup::intent!(fn find_face(..))`, Python `syrup.find_face` | `Runtime::resolve`, Python `syrup.ops.find_face` |
+| names | `verb_[qualifiers_]noun`, closed | composable grammar: counts, selectors, regions, orders, area filters; refuses ambiguity |
+| what runs | the core's functions, in-process | a generated module: region, detector call, coordinates, filters, order, limits |
+| native | optional, `cargo build` of a crate calling the core | always: `rustc` (0.2 s on Linux to 0.6 s on Windows), validated, cached by plan |
+| faces | Viola–Jones cascades (frontal, profile, eyes) | YuNet (CNN) through tract |
+| also | icons by template, glyph text, count/read verbs | QR codes, words with boxes, panels, sessions, Python detectors as targets |
 
 ## What stays
 
-The core crate stays at the repository root, unchanged in this first step.
-MapleSyrup consumes it as a submodule, and its primitives become
-capabilities the runtime composes.
+The core crate stays at the repository root, and the runtime reaches it
+only through its public API: the colour predicates and region grouping
+(which the generated colour kernels are validated against), bar fill,
+sharpness, layout helpers, motion masks, the tracker, OCR and capture. Those
+are capabilities the runtime composes; the core's own entry points, including
+the original `ocr::ocr_region` and `capture::capture_window_by_title_info`,
+are unchanged.
 
 ## What is added
 

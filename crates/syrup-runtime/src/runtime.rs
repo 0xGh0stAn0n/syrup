@@ -766,7 +766,9 @@ impl Session {
             .collect();
         let ids = self.tracker.assign(&centres);
         let tracks = self.tracker.tracks();
+        // Every emitted box is finite (the host checked), so every item has a track.
         for (found, id) in result.items.iter_mut().zip(ids) {
+            let Some(id) = id else { continue };
             let t = tracks
                 .iter()
                 .find(|t| t.id == id)

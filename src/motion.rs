@@ -14,6 +14,7 @@ use image::{GrayImage, Luma, RgbaImage};
 
 use crate::detection::{Confidence, Detection, Reliability};
 use crate::geometry::{Rect, group_segments};
+use crate::scan::{for_each_bit_run, for_each_run};
 use crate::tracking::{ObjectTracker, Track};
 
 /// Compute a binary motion mask between two same-sized frames in one pass:
@@ -26,13 +27,144 @@ pub fn motion_mask(a: &RgbaImage, b: &RgbaImage, threshold: u8) -> Option<GrayIm
     let (w, h) = a.dimensions();
     let mut out = GrayImage::new(w, h);
     for (mask, (pa, pb)) in out.pixels_mut().zip(a.pixels().zip(b.pixels())) {
-        let dr = pa[0].abs_diff(pb[0]) as f32;
-        let dg = pa[1].abs_diff(pb[1]) as f32;
-        let db = pa[2].abs_diff(pb[2]) as f32;
-        let lum = (0.2126 * dr + 0.7152 * dg + 0.0722 * db) as u8;
-        *mask = Luma([if lum >= threshold { 255 } else { 0 }]);
+        *mask = Luma([if moved(pa.0, pb.0, threshold) { 255 } else { 0 }]);
     }
     Some(out)
+}
+
+/// Rec. 709 luma weights in 16-bit fixed point (0.2126, 0.7152, 0.0722).
+/// They sum to exactly 65536, so a grey change of `d` levels weighs exactly
+/// `d`; floating-point weights can fall a hair short and miss a change of
+/// exactly the threshold.
+const LUMA_WEIGHTS: [u32; 3] = [13933, 46871, 4732];
+
+/// The luminance of the per-channel absolute difference of two pixels, in
+/// 16-bit fixed point (`256 << 16` would be a change of 256 levels).
+///
+/// Taking the pixels as arrays rather than slices lets the compiler drop
+/// every bounds check, which is what allows the row loop to vectorise.
+#[inline]
+fn weighted_difference(a: [u8; 4], b: [u8; 4]) -> u32 {
+    LUMA_WEIGHTS[0] * u32::from(a[0].abs_diff(b[0]))
+        + LUMA_WEIGHTS[1] * u32::from(a[1].abs_diff(b[1]))
+        + LUMA_WEIGHTS[2] * u32::from(a[2].abs_diff(b[2]))
+}
+
+/// Whether one pixel changed enough to count as motion: the luminance of
+/// the per-channel absolute difference reaches `threshold`. The detector's
+/// scan judges whole rows with the same weights and the same integers
+/// (`kernels::moved_bits`, many pixels at a time), which the tests hold
+/// to this.
+#[inline]
+fn moved(a: [u8; 4], b: [u8; 4], threshold: u8) -> bool {
+    weighted_difference(a, b) >= u32::from(threshold) << 16
+}
+
+/// Horizontal runs of moved pixels, and how many pixels moved in total,
+/// computed in one pass over the two frames.
+///
+/// Equivalent to building [`motion_mask`] and then scanning it for runs,
+/// without allocating the mask or reading it back: at 1366x768 that is a
+/// megabyte written and read again every frame for nothing. Returns
+/// `(y, start_x, end_x)` runs of at least `min_run_width`, in scan order.
+fn motion_runs(
+    a: &RgbaImage,
+    b: &RgbaImage,
+    threshold: u8,
+    min_run_width: u32,
+) -> (Vec<(u32, u32, u32)>, u64) {
+    let row_bytes = a.width() as usize * 4;
+    let mut scan = RowScan::new(a.width(), threshold, min_run_width);
+    if row_bytes > 0 {
+        for (y, (row_a, row_b)) in a
+            .as_raw()
+            .chunks_exact(row_bytes)
+            .zip(b.as_raw().chunks_exact(row_bytes))
+            .enumerate()
+        {
+            scan.row(y as u32, row_a, row_b);
+        }
+    }
+    (scan.runs, scan.moved_pixels)
+}
+
+/// [`motion_runs`] of `previous` against `image`, leaving `image` in
+/// `previous`: each row is compared and then copied over while both are
+/// still in the cache, where comparing the frames and then copying the new
+/// one reads it twice from memory, and reads the old one's memory again
+/// to write it (33 MB a frame each at 4K).
+fn motion_runs_replacing(
+    previous: &mut RgbaImage,
+    image: &RgbaImage,
+    threshold: u8,
+    min_run_width: u32,
+) -> (Vec<(u32, u32, u32)>, u64) {
+    let row_bytes = image.width() as usize * 4;
+    let mut scan = RowScan::new(image.width(), threshold, min_run_width);
+    if row_bytes > 0 {
+        for (y, (row_a, row_b)) in previous
+            .chunks_exact_mut(row_bytes)
+            .zip(image.as_raw().chunks_exact(row_bytes))
+            .enumerate()
+        {
+            scan.row(y as u32, row_a, row_b);
+            row_a.copy_from_slice(row_b);
+        }
+    }
+    (scan.runs, scan.moved_pixels)
+}
+
+/// The runs of moved pixels of two frames, a row at a time.
+struct RowScan {
+    limit: u32,
+    threshold: u8,
+    min_run: usize,
+    /// A verdict bit per pixel of the row at hand, and how many pixels.
+    verdicts: Vec<u64>,
+    width: usize,
+    runs: Vec<(u32, u32, u32)>,
+    moved_pixels: u64,
+}
+
+impl RowScan {
+    fn new(width: u32, threshold: u8, min_run_width: u32) -> RowScan {
+        RowScan {
+            limit: u32::from(threshold) << 16,
+            threshold,
+            min_run: (min_run_width as usize).max(1),
+            verdicts: Vec::new(),
+            width: width as usize,
+            runs: Vec::new(),
+            moved_pixels: 0,
+        }
+    }
+
+    /// Row `y` of the two frames, `row_a` and `row_b` (RGBA, as wide as
+    /// the frames).
+    fn row(&mut self, y: u32, row_a: &[u8], row_b: &[u8]) {
+        // A row in which no byte changed by `threshold` holds no motion (the
+        // luminance of a difference never exceeds its largest channel): a
+        // reduction many bytes at a time, which lets the static parts of a
+        // frame cost almost nothing.
+        if crate::kernels::largest_difference(row_a, row_b) < self.threshold {
+            return;
+        }
+        // A verdict bit per pixel (`moved`, many at a time); runs are then
+        // read off the bits, a word at a time.
+        let moved_in_row =
+            crate::kernels::moved_bits(row_a, row_b, LUMA_WEIGHTS, self.limit, &mut self.verdicts);
+        self.moved_pixels += u64::from(moved_in_row);
+        // Too few moved pixels for any run to be long enough.
+        if (moved_in_row as usize) < self.min_run {
+            return;
+        }
+        let (runs, min_run) = (&mut self.runs, self.min_run);
+        for_each_bit_run(&self.verdicts, self.width, |start, end| {
+            if end - start >= min_run {
+                runs.push((y, start as u32, end as u32 - 1));
+            }
+        });
+    }
 }
 
 /// Configuration for the motion detector; exposed so callers can retune it
@@ -47,13 +179,19 @@ pub struct MotionConfig {
     pub min_blob_height: u32,
     /// Minimum blob area, in pixels, to keep a candidate (rejects noise).
     pub min_blob_area: u32,
-    /// Changed areas at most this many pixels apart form one blob, so a
-    /// walking person's limbs and edges are one region rather than many.
-    pub merge_distance: u32,
     /// Maximum matching distance (pixels) for the object tracker.
     pub track_match_distance: f32,
     /// How many consecutive missed frames a track survives (occlusion grace).
     pub track_grace_frames: u32,
+    /// The most blobs tracked in one frame: the largest are kept. A frame
+    /// of a busy scene can break into over a thousand moving fragments,
+    /// and the tracker's matching grows with their number times the
+    /// tracks'; the detection says how many were left out.
+    pub max_blobs: usize,
+    /// Changed areas at most this many pixels apart form one blob in
+    /// [`extract_blobs`], so a walking person's limbs and edges are one
+    /// region rather than many. `0` keeps every run's blob apart.
+    pub merge_distance: u32,
 }
 
 impl Default for MotionConfig {
@@ -63,9 +201,10 @@ impl Default for MotionConfig {
             min_run_width: 4,
             min_blob_height: 4,
             min_blob_area: 24,
-            merge_distance: 12,
             track_match_distance: 48.0,
             track_grace_frames: 5,
+            max_blobs: 200,
+            merge_distance: 12,
         }
     }
 }
@@ -108,7 +247,7 @@ impl MotionDetector {
     /// a normal warm-up condition, reported via the failure reason instead
     /// of an empty result that could be mistaken for "confirmed no motion".
     pub fn detect(&mut self, image: &RgbaImage) -> Detection<Vec<MovingBlob>> {
-        let Some(previous) = self.previous_frame.as_ref() else {
+        let Some(previous) = self.previous_frame.as_mut() else {
             self.previous_frame = Some(image.clone());
             self.last_diff_magnitude = 0.0;
             return Detection::missing(
@@ -117,22 +256,35 @@ impl MotionDetector {
             );
         };
 
-        let blobs = match motion_mask(previous, image, self.config.diff_threshold) {
-            Some(mask) => {
-                self.last_diff_magnitude = changed_fraction(&mask);
-                extract_blobs(&mask, &self.config)
-            }
-            None => {
-                // Capture resolution changed between frames (e.g. window
-                // resize); restart the baseline rather than reporting stale
-                // motion computed against mismatched dimensions.
-                self.previous_frame = Some(image.clone());
-                self.last_diff_magnitude = 0.0;
-                return Detection::missing("motion", "frame size changed since previous frame");
-            }
-        };
+        if previous.dimensions() != image.dimensions() {
+            // Capture resolution changed between frames (e.g. window
+            // resize); restart the baseline rather than reporting stale
+            // motion computed against mismatched dimensions.
+            *previous = image.clone();
+            self.last_diff_magnitude = 0.0;
+            return Detection::missing("motion", "frame size changed since previous frame");
+        }
 
-        self.previous_frame = Some(image.clone());
+        // The comparison leaves this frame in the buffer already held, as
+        // the next baseline: same size, so no allocation per frame.
+        let (runs, moved_pixels) = motion_runs_replacing(
+            previous,
+            image,
+            self.config.diff_threshold,
+            self.config.min_run_width,
+        );
+        let total_pixels = image.width() as u64 * image.height() as u64;
+        self.last_diff_magnitude = if total_pixels == 0 {
+            0.0
+        } else {
+            moved_pixels as f32 / total_pixels as f32
+        };
+        let mut blobs = blobs_from_runs(runs, &self.config);
+        let found = blobs.len();
+        if found > self.config.max_blobs {
+            blobs.sort_unstable_by_key(|rect| std::cmp::Reverse(rect.area()));
+            blobs.truncate(self.config.max_blobs);
+        }
 
         let detections: Vec<(f32, f32, f32, f32)> = blobs
             .iter()
@@ -168,7 +320,14 @@ impl MotionDetector {
             } else {
                 Reliability::Heuristic
             };
-            Detection::found(moving, confidence, "motion", reliability)
+            let mut detection = Detection::found(moving, confidence, "motion", reliability);
+            if found > self.config.max_blobs {
+                detection.failure_reason = Some(format!(
+                    "the {} largest of {found} moving regions were tracked",
+                    self.config.max_blobs
+                ));
+            }
+            detection
         }
     }
 
@@ -205,46 +364,52 @@ fn average_confidence(tracks: &[Track]) -> Confidence {
     Confidence::new(total / tracks.len() as f32)
 }
 
-fn changed_fraction(mask: &GrayImage) -> f32 {
-    let (width, height) = mask.dimensions();
-    if width == 0 || height == 0 {
-        return 0.0;
+/// The changed regions between two same-sized frames: what
+/// [`MotionDetector`] hands its tracker (before `max_blobs`), from the same
+/// fused scan, for callers that keep the frames and their own tracking.
+/// Equal to [`extract_blobs`] of [`motion_mask`] with `merge_distance` 0,
+/// without building the mask.
+/// Returns `None` on a size mismatch.
+pub fn regions(a: &RgbaImage, b: &RgbaImage, config: &MotionConfig) -> Option<Vec<Rect>> {
+    if a.dimensions() != b.dimensions() {
+        return None;
     }
-    let total_pixels = width as f32 * height as f32;
-    let moved_pixels: u32 = mask.iter().map(|&v| if v > 0 { 1 } else { 0 }).sum();
-    moved_pixels as f32 / total_pixels
+    let (runs, _) = motion_runs(a, b, config.diff_threshold, config.min_run_width);
+    Some(blobs_from_runs(runs, config))
 }
 
-/// Changed regions of a motion mask: changed pixels at most
-/// `merge_distance` apart are joined, then runs of at least `min_run_width`
-/// are grouped into blobs at least `min_blob_height` rows tall and
-/// `min_blob_area` pixels large.
+/// Changed regions of a motion mask (from [`motion_mask`]): changed pixels
+/// at most `merge_distance` apart are joined, then each joined area becomes
+/// the bounds of its changed pixels, kept when at least `min_run_width`
+/// wide, `min_blob_height` tall and `min_blob_area` large. With
+/// `merge_distance` 0, runs of at least `min_run_width` are grouped as
+/// [`MotionDetector`] groups them.
 pub fn extract_blobs(mask: &GrayImage, config: &MotionConfig) -> Vec<Rect> {
-    let (width, height) = mask.dimensions();
-    if width == 0 || height == 0 {
+    let width = mask.width() as usize;
+    if width == 0 || mask.height() == 0 {
         return Vec::new();
     }
     let reach = config.merge_distance / 2;
-    let joined = dilate(mask, reach);
-    let mut rows = Vec::new();
-    for (y, row) in (0..height).zip(joined.as_raw().chunks_exact(width as usize)) {
-        let mut start: Option<u32> = None;
-        for (x, &value) in (0..width).zip(row) {
-            if value > 0 {
-                if start.is_none() {
-                    start = Some(x);
+    if reach == 0 {
+        let min_run = (config.min_run_width as usize).max(1);
+        let mut runs = Vec::new();
+        for (y, row) in mask.as_raw().chunks_exact(width).enumerate() {
+            for_each_run(row, |start, end| {
+                if end - start >= min_run {
+                    runs.push((y as u32, start as u32, end as u32 - 1));
                 }
-            } else if let Some(begin) = start {
-                rows.push((y, begin, x - 1));
-                start = None;
-            }
+            });
         }
-        if let Some(begin) = start {
-            rows.push((y, begin, width - 1));
-        }
+        return blobs_from_runs(runs, config);
     }
-
-    group_segments(rows, 1, 1)
+    let joined = dilate(mask, reach as usize);
+    let mut runs = Vec::new();
+    for (y, row) in joined.as_raw().chunks_exact(width).enumerate() {
+        for_each_run(row, |start, end| {
+            runs.push((y as u32, start as u32, end as u32 - 1));
+        });
+    }
+    group_segments(runs, 1, 1)
         .into_iter()
         .filter_map(|rect| changed_bounds(mask, rect))
         .filter(|rect| {
@@ -257,12 +422,16 @@ pub fn extract_blobs(mask: &GrayImage, config: &MotionConfig) -> Vec<Rect> {
 
 /// The bounds of the changed pixels inside `rect`.
 fn changed_bounds(mask: &GrayImage, rect: Rect) -> Option<Rect> {
+    let width = mask.width() as usize;
     let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
     for y in rect.y..rect.y + rect.h {
-        for x in rect.x..rect.x + rect.w {
-            if mask.get_pixel(x, y).0[0] > 0 {
-                (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
-            }
+        let row = &mask.as_raw()[y as usize * width..][rect.x as usize..(rect.x + rect.w) as usize];
+        if let (Some(first), Some(last)) = (
+            row.iter().position(|&v| v > 0),
+            row.iter().rposition(|&v| v > 0),
+        ) {
+            (x0, x1) = (x0.min(rect.x + first as u32), x1.max(rect.x + last as u32));
+            (y0, y1) = (y0.min(y), y1.max(y));
         }
     }
     (x0 <= x1).then(|| Rect {
@@ -274,14 +443,9 @@ fn changed_bounds(mask: &GrayImage, rect: Rect) -> Option<Rect> {
 }
 
 /// The mask with every changed pixel grown into a square `2 * reach + 1`
-/// pixels wide, from sliding counts of changed pixels: along each row, then
-/// down each column.
-fn dilate(mask: &GrayImage, reach: u32) -> GrayImage {
-    if reach == 0 {
-        return mask.clone();
-    }
+/// pixels wide, from sliding counts: along each row, then down the columns.
+fn dilate(mask: &GrayImage, reach: usize) -> GrayImage {
     let (width, height) = (mask.width() as usize, mask.height() as usize);
-    let reach = reach as usize;
     let mut across = vec![0u8; width * height];
     for (row, out) in mask
         .as_raw()
@@ -291,18 +455,18 @@ fn dilate(mask: &GrayImage, reach: u32) -> GrayImage {
         let mut count = row[..reach.min(width)].iter().filter(|&&v| v > 0).count();
         for x in 0..width {
             if x + reach < width {
-                count += (row[x + reach] > 0) as usize;
+                count += usize::from(row[x + reach] > 0);
             }
             if x > reach {
-                count -= (row[x - reach - 1] > 0) as usize;
+                count -= usize::from(row[x - reach - 1] > 0);
             }
-            out[x] = (count > 0) as u8;
+            out[x] = u8::from(count > 0);
         }
     }
     let mut counts = vec![0u32; width];
     let add = |counts: &mut [u32], y: usize, sign: i32| {
         for (count, &set) in counts.iter_mut().zip(&across[y * width..(y + 1) * width]) {
-            *count = count.wrapping_add_signed(sign * set as i32);
+            *count = count.wrapping_add_signed(sign * i32::from(set));
         }
     };
     let mut out = GrayImage::new(width as u32, height as u32);
@@ -316,12 +480,21 @@ fn dilate(mask: &GrayImage, reach: u32) -> GrayImage {
         if y > reach {
             add(&mut counts, y - reach - 1, -1);
         }
-        let row = &mut out.as_mut()[y * width..(y + 1) * width];
-        for (pixel, &count) in row.iter_mut().zip(&counts) {
+        for (pixel, &count) in out.as_mut()[y * width..(y + 1) * width]
+            .iter_mut()
+            .zip(&counts)
+        {
             *pixel = if count > 0 { 255 } else { 0 };
         }
     }
     out
+}
+
+fn blobs_from_runs(runs: Vec<(u32, u32, u32)>, config: &MotionConfig) -> Vec<Rect> {
+    group_segments(runs, config.min_blob_height, 1)
+        .into_iter()
+        .filter(|rect| rect.area() >= config.min_blob_area)
+        .collect()
 }
 
 #[cfg(test)]
@@ -340,16 +513,6 @@ mod tests {
     }
 
     #[test]
-    fn motion_mask_flags_only_changed_pixels() {
-        let a = frame_with_square(32, 32, (4, 4), 4);
-        let b = frame_with_square(32, 32, (20, 4), 4);
-        let mask = motion_mask(&a, &b, 28).unwrap();
-        assert!(mask.get_pixel(5, 5).0[0] > 0, "vacated pixels are motion");
-        assert!(mask.get_pixel(21, 5).0[0] > 0, "entered pixels are motion");
-        assert_eq!(mask.get_pixel(15, 15).0[0], 0, "unchanged pixel is still");
-    }
-
-    #[test]
     fn nearby_changes_form_one_blob_and_distant_ones_stay_apart() {
         let mut mask = GrayImage::new(120, 60);
         let mut fill = |x0: u32, y0: u32, w: u32, h: u32| {
@@ -365,23 +528,155 @@ mod tests {
         fill(90, 20, 10, 10);
         let mut blobs = extract_blobs(&mask, &MotionConfig::default());
         blobs.sort_by_key(|rect| rect.x);
+        let rect = |x, y, w, h| Rect { x, y, w, h };
+        assert_eq!(blobs, [rect(8, 5, 12, 46), rect(90, 20, 10, 10)]);
+    }
+
+    #[test]
+    fn blobs_from_a_mask_match_the_fused_scan() {
+        // Without merging, the mask path groups runs as the detector does.
+        let config = MotionConfig {
+            merge_distance: 0,
+            ..MotionConfig::default()
+        };
+        let a = frame_with_square(64, 48, (4, 4), 12);
+        let b = frame_with_square(64, 48, (30, 20), 12);
+        let mask = motion_mask(&a, &b, config.diff_threshold).unwrap();
+        let (runs, _) = motion_runs(&a, &b, config.diff_threshold, config.min_run_width);
+        let from_mask = extract_blobs(&mask, &config);
+        assert_eq!(from_mask, blobs_from_runs(runs, &config));
+        assert_eq!(regions(&a, &b, &config).as_ref(), Some(&from_mask));
         assert_eq!(
-            blobs,
-            [
-                Rect {
-                    x: 8,
-                    y: 5,
-                    w: 12,
-                    h: 46
-                },
-                Rect {
-                    x: 90,
-                    y: 20,
-                    w: 10,
-                    h: 10
-                },
-            ]
+            regions(&a, &frame_with_square(32, 48, (0, 0), 1), &config),
+            None
         );
+        // The square it left and the square it entered.
+        assert_eq!(from_mask.len(), 2, "{from_mask:?}");
+    }
+
+    #[test]
+    fn runs_found_while_replacing_the_frame_are_the_runs_found_comparing() {
+        let config = MotionConfig::default();
+        for (a, b) in [
+            (
+                frame_with_square(64, 48, (4, 4), 12),
+                frame_with_square(64, 48, (30, 20), 12),
+            ),
+            (
+                frame_with_square(37, 23, (0, 0), 30),
+                frame_with_square(37, 23, (5, 3), 8),
+            ),
+            (
+                frame_with_square(16, 16, (2, 2), 4),
+                frame_with_square(16, 16, (2, 2), 4),
+            ),
+        ] {
+            let compared = motion_runs(&a, &b, config.diff_threshold, config.min_run_width);
+            let mut previous = a.clone();
+            let replaced = motion_runs_replacing(
+                &mut previous,
+                &b,
+                config.diff_threshold,
+                config.min_run_width,
+            );
+            assert_eq!(replaced, compared);
+            assert_eq!(previous, b, "the new frame is left as the baseline");
+        }
+    }
+
+    #[test]
+    fn motion_mask_flags_only_changed_pixels() {
+        let a = frame_with_square(32, 32, (4, 4), 4);
+        let b = frame_with_square(32, 32, (20, 4), 4);
+        let mask = motion_mask(&a, &b, 28).unwrap();
+        assert!(mask.get_pixel(5, 5).0[0] > 0, "vacated pixels are motion");
+        assert!(mask.get_pixel(21, 5).0[0] > 0, "entered pixels are motion");
+        assert_eq!(mask.get_pixel(15, 15).0[0], 0, "unchanged pixel is still");
+    }
+
+    /// A grey change of exactly the threshold counts; one level less does
+    /// not. (Floating-point weights summing to a hair under 1 got this
+    /// wrong for some levels.)
+    #[test]
+    fn grey_changes_are_measured_exactly() {
+        let base = [0u8, 0, 0, 255];
+        for threshold in 1..=255u8 {
+            let at = [threshold, threshold, threshold, 255];
+            let below = [threshold - 1, threshold - 1, threshold - 1, 255];
+            assert!(moved(base, at, threshold), "grey {threshold}");
+            assert!(!moved(base, below, threshold), "grey {}", threshold - 1);
+        }
+        assert!(moved(base, base, 0), "threshold 0 counts every pixel");
+    }
+
+    /// The fixed-point verdict agrees with Rec. 709 luminance everywhere
+    /// except within rounding distance of the threshold.
+    #[test]
+    fn verdict_follows_rec709_luminance() {
+        let levels: Vec<u8> = (0..=70u8).chain((71..=255u8).step_by(7)).collect();
+        for &threshold in &[1u8, 2, 28, 29, 100, 254, 255] {
+            for &r in &levels {
+                for &g in &levels {
+                    for &b in &levels {
+                        let luminance = 0.2126 * r as f64 + 0.7152 * g as f64 + 0.0722 * b as f64;
+                        if (luminance - threshold as f64).abs() < 0.01 {
+                            continue;
+                        }
+                        assert_eq!(
+                            moved([0, 0, 0, 255], [r, g, b, 255], threshold),
+                            luminance >= threshold as f64,
+                            "diff {r},{g},{b} at threshold {threshold}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The fused scan must find exactly the runs (and moved-pixel count)
+    /// that scanning the explicit mask finds.
+    #[test]
+    fn fused_runs_match_scanning_the_mask() {
+        let mut a = RgbaImage::from_pixel(97, 61, Rgba([20, 20, 20, 255]));
+        let mut b = a.clone();
+        // A pseudo-random speckle of changes, plus runs touching both edges.
+        let mut state = 12345u32;
+        for y in 0..61 {
+            for x in 0..97 {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                let v = (state >> 16) as u8;
+                if v > 170 {
+                    b.put_pixel(x, y, Rgba([v, v / 2, 255 - v, 255]));
+                }
+            }
+        }
+        for x in 0..97 {
+            a.put_pixel(x, 30, Rgba([250, 250, 250, 255]));
+        }
+        let mask = motion_mask(&a, &b, 28).unwrap();
+        let mut expected = Vec::new();
+        let mut expected_moved = 0u64;
+        for y in 0..61u32 {
+            let mut start = None;
+            for x in 0..97u32 {
+                if mask.get_pixel(x, y).0[0] > 0 {
+                    expected_moved += 1;
+                    start.get_or_insert(x);
+                } else if let Some(begin) = start.take()
+                    && x - begin >= 3
+                {
+                    expected.push((y, begin, x - 1));
+                }
+            }
+            if let Some(begin) = start
+                && 97 - begin >= 3
+            {
+                expected.push((y, begin, 96));
+            }
+        }
+        let (runs, moved) = motion_runs(&a, &b, 28, 3);
+        assert_eq!(runs, expected);
+        assert_eq!(moved, expected_moved);
     }
 
     #[test]
@@ -443,6 +738,43 @@ mod tests {
         assert!(!blobs.is_empty());
         assert!(blobs.iter().all(|blob| blob.is_predicted));
         assert_eq!(predicted.reliability, Reliability::Predicted);
+    }
+
+    #[test]
+    fn a_busy_frame_tracks_its_largest_blobs_and_says_so() {
+        // A grid of squares appearing at once: 6 x 6 = 36 blobs, two of
+        // them bigger than the rest.
+        let mut detector = MotionDetector::new(MotionConfig {
+            max_blobs: 8,
+            ..MotionConfig::default()
+        });
+        detector.detect(&RgbaImage::from_pixel(160, 160, Rgba([20, 20, 20, 255])));
+        let mut busy = RgbaImage::from_pixel(160, 160, Rgba([20, 20, 20, 255]));
+        for row in 0..6u32 {
+            for column in 0..6u32 {
+                let size = if (row, column) == (0, 0) || (row, column) == (5, 5) {
+                    14
+                } else {
+                    6
+                };
+                for y in row * 26..row * 26 + size {
+                    for x in column * 26..column * 26 + size {
+                        busy.put_pixel(x, y, Rgba([230, 230, 230, 255]));
+                    }
+                }
+            }
+        }
+        let detection = detector.detect(&busy);
+        let blobs = detection.value.as_ref().expect("motion");
+        assert_eq!(blobs.len(), 8, "{blobs:?}");
+        assert!(
+            blobs.iter().filter(|b| b.bounds.w >= 14).count() == 2,
+            "the two big ones are among those kept: {blobs:?}"
+        );
+        assert_eq!(
+            detection.failure_reason.as_deref(),
+            Some("the 8 largest of 36 moving regions were tracked")
+        );
     }
 
     #[test]

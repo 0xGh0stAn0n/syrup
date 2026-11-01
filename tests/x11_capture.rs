@@ -61,7 +61,7 @@ fn covered_windows_are_captured_as_drawn() {
     // A window manager maps windows when it gets to them.
     let listed = (0..50).any(|_| {
         std::thread::sleep(std::time::Duration::from_millis(100));
-        syrup::capture::list_windows().unwrap().contains(&title)
+        syrup::capture::window_titles().unwrap().contains(&title)
     });
     assert!(listed, "{title} never appeared");
     let mut window = Window::find(&title.to_uppercase()).unwrap();

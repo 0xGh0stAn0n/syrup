@@ -7,24 +7,121 @@ pub type Hsv = (f32, f32, f32);
 
 /// Convert RGB to HSV. H in degrees `[0, 360)`, S and V in `[0, 1]`.
 pub fn hsv_from_rgb(r: u8, g: u8, b: u8) -> Hsv {
-    let rf = r as f32 / 255.0;
-    let gf = g as f32 / 255.0;
-    let bf = b as f32 / 255.0;
-    let max = rf.max(gf).max(bf);
-    let min = rf.min(gf).min(bf);
-    let delta = max - min;
-    let h = if delta == 0.0 {
-        0.0
-    } else if max == rf {
-        60.0 * ((gf - bf) / delta % 6.0)
-    } else if max == gf {
-        60.0 * ((bf - rf) / delta + 2.0)
-    } else {
-        60.0 * ((rf - gf) / delta + 4.0)
-    };
-    let h = if h < 0.0 { h + 360.0 } else { h };
-    let s = if max == 0.0 { 0.0 } else { delta / max };
-    (h, s.clamp(0.0, 1.0), max.clamp(0.0, 1.0))
+    let parts = HsvParts::new(r, g, b);
+    (parts.hue(), parts.saturation(), parts.value())
+}
+
+/// The saturation and value of [`hsv_from_rgb`], without the hue (which
+/// needs a division and branches): the same two numbers.
+pub fn saturation_and_value(r: u8, g: u8, b: u8) -> (f32, f32) {
+    let parts = HsvParts::new(r, g, b);
+    (parts.saturation(), parts.value())
+}
+
+/// [`saturation_and_value`]'s two numbers tested against least values —
+/// `saturation >= min_saturation && value >= min_value` — from a table:
+/// both depend on a pixel's brightest and darkest channels alone (dividing
+/// by 255 keeps the channels' order), so a bit for each such pair answers
+/// for every colour exactly, without the divisions.
+pub struct SaturationValueTest {
+    /// Bit `darkest` of row `brightest`, 4 words a row.
+    bits: Vec<u64>,
+}
+
+impl SaturationValueTest {
+    /// The test for these least values: made the first time they are asked
+    /// for, and kept.
+    pub fn get(min_saturation: f32, min_value: f32) -> &'static SaturationValueTest {
+        type Made = Vec<((u32, u32), &'static SaturationValueTest)>;
+        static MADE: std::sync::Mutex<Made> = std::sync::Mutex::new(Vec::new());
+        let key = (min_saturation.to_bits(), min_value.to_bits());
+        let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, test)) = made.iter().find(|(k, _)| *k == key) {
+            return test;
+        }
+        let mut bits = vec![0u64; 256 * 4];
+        for brightest in 0..256usize {
+            for darkest in 0..=brightest {
+                let (s, v) = saturation_and_value(brightest as u8, darkest as u8, darkest as u8);
+                if s >= min_saturation && v >= min_value {
+                    bits[brightest * 4 + darkest / 64] |= 1 << (darkest % 64);
+                }
+            }
+        }
+        let test: &'static SaturationValueTest = Box::leak(Box::new(SaturationValueTest { bits }));
+        made.push((key, test));
+        test
+    }
+
+    /// Whether the colour passes.
+    #[inline]
+    pub fn passes(&self, r: u8, g: u8, b: u8) -> bool {
+        let (brightest, darkest) = (r.max(g).max(b) as usize, r.min(g).min(b) as usize);
+        (self.bits[brightest * 4 + darkest / 64] >> (darkest % 64)) & 1 != 0
+    }
+}
+
+/// The intermediate values of an RGB→HSV conversion, so predicates can test
+/// value and saturation — cheap — and compute the hue, which needs a
+/// division and branches, only for the few pixels that pass both. On a
+/// typical frame most pixels are too dark or too grey to match any colour.
+///
+/// Every quantity is computed with exactly the arithmetic [`hsv_from_rgb`]
+/// uses, so the lazy path and the full conversion can never disagree.
+struct HsvParts {
+    rf: f32,
+    gf: f32,
+    bf: f32,
+    max: f32,
+    delta: f32,
+}
+
+impl HsvParts {
+    #[inline]
+    fn new(r: u8, g: u8, b: u8) -> Self {
+        let rf = r as f32 / 255.0;
+        let gf = g as f32 / 255.0;
+        let bf = b as f32 / 255.0;
+        let max = rf.max(gf).max(bf);
+        let min = rf.min(gf).min(bf);
+        Self {
+            rf,
+            gf,
+            bf,
+            max,
+            delta: max - min,
+        }
+    }
+
+    #[inline]
+    fn value(&self) -> f32 {
+        self.max.clamp(0.0, 1.0)
+    }
+
+    #[inline]
+    fn saturation(&self) -> f32 {
+        let s = if self.max == 0.0 {
+            0.0
+        } else {
+            self.delta / self.max
+        };
+        s.clamp(0.0, 1.0)
+    }
+
+    #[inline]
+    fn hue(&self) -> f32 {
+        let (rf, gf, bf, max, delta) = (self.rf, self.gf, self.bf, self.max, self.delta);
+        let h = if delta == 0.0 {
+            0.0
+        } else if max == rf {
+            60.0 * ((gf - bf) / delta % 6.0)
+        } else if max == gf {
+            60.0 * ((bf - rf) / delta + 2.0)
+        } else {
+            60.0 * ((rf - gf) / delta + 4.0)
+        };
+        if h < 0.0 { h + 360.0 } else { h }
+    }
 }
 
 /// Is `hue` within `[min, max]`, where a range with `min > max` wraps
@@ -45,19 +142,16 @@ pub fn is_color_pixel(
     min_saturation: f32,
     min_value: f32,
 ) -> bool {
-    // The same values as hsv_from_rgb; the hue only when it can matter.
     let alpha = pixel[3] as f32 / 255.0;
     if alpha < 0.5 {
         return false;
     }
-    let (s, v) = saturation_value(pixel[0], pixel[1], pixel[2]);
-    s >= min_saturation
-        && v >= min_value
-        && hue_in_range(
-            hsv_from_rgb(pixel[0], pixel[1], pixel[2]).0,
-            hue_range.0,
-            hue_range.1,
-        )
+    // Cheapest rejections first; the hue is computed last and only when the
+    // pixel is already bright and saturated enough to matter.
+    let parts = HsvParts::new(pixel[0], pixel[1], pixel[2]);
+    parts.value() >= min_value
+        && parts.saturation() >= min_saturation
+        && hue_in_range(parts.hue(), hue_range.0, hue_range.1)
 }
 
 /// Does this pixel plausibly belong to rendered UI text?
@@ -65,27 +159,17 @@ pub fn is_color_pixel(
 /// UI text is bright, fairly desaturated, and opaque; the thresholds were
 /// tuned against real interface captures.
 pub fn is_text_pixel(pixel: &Rgba<u8>) -> bool {
-    let brightness =
-        0.299 * (pixel[0] as f32) + 0.587 * (pixel[1] as f32) + 0.114 * (pixel[2] as f32);
-    if !alpha_is_high(pixel) || brightness < 90.0 {
+    if !alpha_is_high(pixel) {
         return false;
     }
-    let (s, v) = saturation_value(pixel[0], pixel[1], pixel[2]);
-    let is_desaturated = s <= 0.55;
-    let is_light = v >= 0.45;
-    is_desaturated && is_light
-}
-
-/// The saturation and value `hsv_from_rgb` returns, without the hue.
-fn saturation_value(r: u8, g: u8, b: u8) -> (f32, f32) {
-    let rf = r as f32 / 255.0;
-    let gf = g as f32 / 255.0;
-    let bf = b as f32 / 255.0;
-    let max = rf.max(gf).max(bf);
-    let min = rf.min(gf).min(bf);
-    let delta = max - min;
-    let s = if max == 0.0 { 0.0 } else { delta / max };
-    (s.clamp(0.0, 1.0), max.clamp(0.0, 1.0))
+    let brightness =
+        0.299 * (pixel[0] as f32) + 0.587 * (pixel[1] as f32) + 0.114 * (pixel[2] as f32);
+    if brightness < 90.0 {
+        return false;
+    }
+    // The hue plays no part here, so it is never computed.
+    let parts = HsvParts::new(pixel[0], pixel[1], pixel[2]);
+    parts.saturation() <= 0.55 && parts.value() >= 0.45
 }
 
 /// Is this pixel opaque enough to be foreground rather than a blend edge?
@@ -93,21 +177,76 @@ fn alpha_is_high(pixel: &Rgba<u8>) -> bool {
     pixel[3] as f32 / 255.0 >= 0.45
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn saturation_value_matches_the_full_conversion() {
-        use super::*;
-        for r in (0..=255u8).step_by(3) {
-            for g in (0..=255u8).step_by(3) {
-                for b in (0..=255u8).step_by(3) {
-                    let (_, s, v) = hsv_from_rgb(r, g, b);
-                    assert_eq!(saturation_value(r, g, b), (s, v), "{r} {g} {b}");
-                }
+/// [`is_text_pixel`] from tables, for testing every pixel of a region: the
+/// same answer for every pixel, without its divisions. Each test it makes
+/// depends on less than the whole pixel: the opacity on the alpha; the
+/// value on the brightest channel, and the saturation on the brightest and
+/// the darkest (dividing by 255 keeps the channels' order); and the
+/// brightness, for a green and blue, on the red being at least the least
+/// that is bright enough (each step of the sum only grows with the red).
+pub(crate) struct TextTables {
+    alpha: [bool; 256],
+    value: [bool; 256],
+    /// By `brightest · 256 + darkest`.
+    saturation: Vec<bool>,
+    /// By `green · 256 + blue`: the least red bright enough (256: none).
+    red_from: Vec<u16>,
+}
+
+impl TextTables {
+    /// The tables, made once.
+    pub(crate) fn get() -> &'static TextTables {
+        static TABLES: std::sync::OnceLock<TextTables> = std::sync::OnceLock::new();
+        TABLES.get_or_init(TextTables::new)
+    }
+
+    fn new() -> TextTables {
+        let alpha = std::array::from_fn(|a| alpha_is_high(&Rgba([0, 0, 0, a as u8])));
+        let value = std::array::from_fn(|m| {
+            let parts = HsvParts::new(m as u8, m as u8, m as u8);
+            parts.value() >= 0.45
+        });
+        let mut saturation = vec![false; 256 * 256];
+        for brightest in 0..256usize {
+            for darkest in 0..=brightest {
+                let parts = HsvParts::new(brightest as u8, darkest as u8, darkest as u8);
+                saturation[brightest * 256 + darkest] = parts.saturation() <= 0.55;
             }
+        }
+        let bright = |r: u8, g: u8, b: u8| {
+            0.299 * (r as f32) + 0.587 * (g as f32) + 0.114 * (b as f32) >= 90.0
+        };
+        let mut red_from = vec![256u16; 256 * 256];
+        for g in 0..256usize {
+            for b in 0..256usize {
+                red_from[g * 256 + b] = (0..=255u8)
+                    .find(|&r| bright(r, g as u8, b as u8))
+                    .map_or(256, u16::from);
+            }
+        }
+        TextTables {
+            alpha,
+            value,
+            saturation,
+            red_from,
         }
     }
 
+    /// [`is_text_pixel`].
+    #[inline]
+    pub(crate) fn matches(&self, pixel: &[u8; 4]) -> bool {
+        let [r, g, b, a] = *pixel;
+        if !self.alpha[a as usize] || u16::from(r) < self.red_from[g as usize * 256 + b as usize] {
+            return false;
+        }
+        let (brightest, darkest) = (r.max(g).max(b), r.min(g).min(b));
+        self.value[brightest as usize]
+            && self.saturation[brightest as usize * 256 + darkest as usize]
+    }
+}
+
+#[cfg(test)]
+mod tests {
     use super::*;
 
     #[test]
@@ -131,6 +270,140 @@ mod tests {
         assert!(hue_in_range(10.0, 340.0, 30.0));
         assert!(!hue_in_range(180.0, 340.0, 30.0));
         assert!(hue_in_range(180.0, 100.0, 200.0));
+    }
+
+    /// The original, eager implementation, kept to prove the lazy predicates
+    /// accept exactly the same pixels.
+    fn reference_is_color_pixel(
+        pixel: &Rgba<u8>,
+        hue_range: (f32, f32),
+        min_saturation: f32,
+        min_value: f32,
+    ) -> bool {
+        let (h, s, v) = hsv_from_rgb(pixel[0], pixel[1], pixel[2]);
+        let alpha = pixel[3] as f32 / 255.0;
+        alpha >= 0.5
+            && hue_in_range(h, hue_range.0, hue_range.1)
+            && s >= min_saturation
+            && v >= min_value
+    }
+
+    fn reference_is_text_pixel(pixel: &Rgba<u8>) -> bool {
+        let (_, s, v) = hsv_from_rgb(pixel[0], pixel[1], pixel[2]);
+        let brightness =
+            0.299 * (pixel[0] as f32) + 0.587 * (pixel[1] as f32) + 0.114 * (pixel[2] as f32);
+        alpha_is_high(pixel) && brightness >= 90.0 && s <= 0.55 && v >= 0.45
+    }
+
+    #[test]
+    fn lazy_predicates_match_the_eager_reference_exactly() {
+        // Every 5th value per channel plus both extremes covers the boundaries
+        // of all thresholds used below without taking 16M iterations.
+        let levels: Vec<u8> = (0..=255u16)
+            .step_by(5)
+            .map(|v| v as u8)
+            .chain([255])
+            .collect();
+        let ranges = [
+            ((340.0, 30.0), 0.35, 0.30),
+            ((190.0, 250.0), 0.30, 0.30),
+            ((40.0, 80.0), 0.25, 0.25),
+        ];
+        for &r in &levels {
+            for &g in &levels {
+                for &b in &levels {
+                    for alpha in [0u8, 127, 128, 255] {
+                        let pixel = Rgba([r, g, b, alpha]);
+                        for (hue, s, v) in ranges {
+                            assert_eq!(
+                                is_color_pixel(&pixel, hue, s, v),
+                                reference_is_color_pixel(&pixel, hue, s, v),
+                                "{pixel:?} {hue:?}"
+                            );
+                        }
+                        assert_eq!(
+                            is_text_pixel(&pixel),
+                            reference_is_text_pixel(&pixel),
+                            "{pixel:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn saturation_and_value_are_the_conversions() {
+        for r in (0..=255u8).step_by(3) {
+            for g in (0..=255u8).step_by(5) {
+                for b in (0..=255u8).step_by(7) {
+                    let (_, s, v) = hsv_from_rgb(r, g, b);
+                    let (s2, v2) = saturation_and_value(r, g, b);
+                    assert_eq!((s.to_bits(), v.to_bits()), (s2.to_bits(), v2.to_bits()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_saturation_and_value_test_from_a_table_answers_for_every_colour() {
+        // Every colour in a release build; every third level of each
+        // channel (and both ends) where the build is slow.
+        let levels: Vec<u8> = if cfg!(debug_assertions) {
+            (0..=255u16)
+                .step_by(3)
+                .map(|v| v as u8)
+                .chain([255])
+                .collect()
+        } else {
+            (0..=255).collect()
+        };
+        for (min_s, min_v) in [(0.35f32, 0.45f32), (0.0, 0.0), (1.0, 1.0), (0.5, 0.2)] {
+            let test = SaturationValueTest::get(min_s, min_v);
+            assert!(std::ptr::eq(test, SaturationValueTest::get(min_s, min_v)));
+            for &r in &levels {
+                for &g in &levels {
+                    for &b in &levels {
+                        let (s, v) = saturation_and_value(r, g, b);
+                        assert_eq!(
+                            test.passes(r, g, b),
+                            s >= min_s && v >= min_v,
+                            "{r} {g} {b} at {min_s} {min_v}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_text_test_from_tables_answers_as_the_predicate_for_every_colour() {
+        let tables = TextTables::get();
+        // Every colour in a release build; every third level of each
+        // channel (and both ends) where the build is slow.
+        let levels: Vec<u8> = if cfg!(debug_assertions) {
+            (0..=255u16)
+                .step_by(3)
+                .map(|v| v as u8)
+                .chain([255])
+                .collect()
+        } else {
+            (0..=255).collect()
+        };
+        for &r in &levels {
+            for &g in &levels {
+                for &b in &levels {
+                    for alpha in [0u8, 114, 115, 255] {
+                        let pixel = [r, g, b, alpha];
+                        assert_eq!(
+                            tables.matches(&pixel),
+                            is_text_pixel(&Rgba(pixel)),
+                            "{pixel:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -24,4 +24,29 @@ syrup.bundle("ops-bundle", "find_largest_face", "find_words")
 
 Detectors from other libraries plug in with `syrup.add_target`. The grammar,
 result contract and failure classes are in
-[docs/contract.md](https://github.com/0xGh0stAn0n/syrup/blob/main/docs/contract.md).
+[crates/syrup-runtime/docs/contract.md](https://github.com/boggioMichael/syrup/blob/main/crates/syrup-runtime/docs/contract.md).
+
+## Install
+
+```sh
+pip install ./python            # builds the extension with maturin
+pip install "./python[test]"    # and what the tests need
+pytest python/tests
+```
+
+## The in-process intents (`syrup.find_face`, `syrup.legacy`)
+
+Names on the package itself — `syrup.find_face`, `syrup.find_eyes`,
+`syrup.measure_red_bar`, `syrup.find_<name>_icon` — are the core library's
+in-process intents (`syrup::intent`: cascade faces, eyes and profile faces,
+icons by template, bars, blobs, text, motion), reached through its C API
+(`src/capi.rs`). They are a separate vocabulary with their own results,
+`Detection(value, confidence, reliability, failure_reason)`, and need only
+the core library: `cargo build --release` produces
+`target/release/libsyrup.so` (`.dylib`, `syrup.dll`), which `syrup.legacy`
+finds from the checkout or through `SYRUP_LIBRARY`.
+
+```sh
+cargo build --release
+python3 python/test_legacy.py
+```

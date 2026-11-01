@@ -1,109 +1,141 @@
 # Syrup
 
-A small Rust toolkit for turning captured frames into structured,
-confidence-scored visual observations.
+A Rust computer-vision library where you name the function you need and
+the library builds it.
 
-Syrup gives you the pixel-level building blocks for reading a screen the
-way a person does — "there is a bar here and it is about 60% full", "that
-region moved left", "this text says 1291/1351" — without pretending to more
-certainty than the pixels support. Every detector result carries a
-confidence score, a reliability grade, and a failure reason when nothing was
-found.
+![syrup annotating a gameplay recording live: motion tracks with ids, template matches, bar fills, a seven-segment timer read by learned glyphs](docs/demo.gif)
 
-## Operations by name
+*Every number in the overlay is computed by the library on that frame —
+motion tracks, template matches, bar fills, a timer read from a font it
+learned — and the overlay is drawn with `syrup::draw`.*
 
-Name the operation you want and Syrup builds it:
+```rust
+use syrup::prelude::*;
+
+syrup::intent!(fn find_face(image: &RgbaImage) -> Detection<Vec<Match>>);
+syrup::intent!(fn measure_red_bar(image: &RgbaImage) -> Detection<f32>);
+
+let frame: RgbaImage = image::open("frame.png")?.to_rgba8();
+for face in find_face(&frame).value.unwrap_or_default() {
+    println!("face at {:?}, score {:.2}", face.bounds, face.score);
+}
+println!("HP: {:?}%", measure_red_bar(&frame).value);
+```
+
+`find_face` does not exist until that line. The name is parsed against a
+small vocabulary — a verb, optional qualifiers, a noun — and turned into a
+plan over the library's primitives (here: the bundled Viola–Jones
+frontal-face cascade). The plan runs in-process on the first call, or is
+written out as Rust, compiled with cargo into a `.so`/`.dll`/`.dylib`, and
+loaded back, so the function you invented is also a native library any
+process can call (`intent::resolve("find_face")?.compile()`, or
+`SYRUP_INTENT_MODE=native`). The generated source is kept next to the
+build, so you can read what was invented, copy it, or edit it.
+
+The same from Python, over the library's C API — `import syrup` and any
+attribute named like an intent is a function:
+
+```python
+import syrup
+faces = syrup.find_face(image)      # PIL image or numpy uint8 array
+print([f.bounds for f in faces.value], faces.confidence)
+```
+
+### Compiled operations: `syrup-runtime`
+
+The runtime in `crates/syrup-runtime` (written by Eitan) takes the idea all
+the way. A name is parsed against a composable grammar — counts, selectors,
+regions, orders, area filters — into a typed plan whose coordinate spaces
+are checked, and the plan becomes a small dependency-free Rust module that
+is compiled with `rustc` (no cargo, no network), validated against a
+reference interpreter on synthetic images, cached by plan and loaded:
 
 ```python
 from syrup.ops import find_largest_face_in_top_half
 
-faces = find_largest_face_in_top_half("photo.jpg")
+faces = find_largest_face_in_top_half("photo.jpg")      # YuNet, a CNN, through tract
 for face in faces:
     print(face.box, face.confidence, face.keypoints["left_eye"])
-```
 
-Nobody wrote `find_largest_face_in_top_half`. The name is parsed into an
-intent, the intent into a typed plan, and the plan into a small Rust module
-that is compiled with `rustc`, checked against a reference interpreter,
-cached, and loaded. Later calls and later processes reuse the compiled
-module. Names Syrup cannot honour fail at import with a reason:
-`find_best_face` is refused because "best" does not say by what.
-
-Measurements compose the same way, using the core's own measures:
-
-```python
-from syrup.ops import measure_fill_of_largest_red_bar_in_bottom_third, measure_sharpness_of_words
-
-(health,) = measure_fill_of_largest_red_bar_in_bottom_third(frame)  # health.value == 0.4
-blurry = [w for w in measure_sharpness_of_words(frame) if w.value < 0.35]
-```
-
-Video goes through sessions, which keep ids across frames with the core's
-tracker. `syrup.capture.window("title")` yields a live window's frames on
-Windows, macOS and Linux:
-
-```python
-session = syrup.ops.track_moving_regions_in_top_half.session()
-for frame in frames:
+session = syrup.ops.track_moving_regions.session()      # ids across frames
+for frame in syrup.capture.window("Notepad"):           # Windows, macOS, X11, Wayland
     for region in session(frame):
         print(region.track.id, region.track.velocity)
 ```
 
-Detectors from any Python library become nouns the same way:
+Names that do not say enough are refused with a reason (`find_best_face`:
+best by what?), names that mean the same share one artifact, other detectors
+become nouns (`syrup.add_target("licence_plate", detect)`, or the YOLO and
+MediaPipe recipes), and `syrup bundle` prepares operations for machines
+without a compiler. The same engine is `syrup_runtime::Runtime` from Rust and
+`syrup explain | source | run | watch | bundle` from the command line. The
+grammar, the result contract and every failure are in
+[crates/syrup-runtime/docs/contract.md](crates/syrup-runtime/docs/contract.md);
+how it relates to `syrup::intent` is in
+[crates/syrup-runtime/docs/architecture.md](crates/syrup-runtime/docs/architecture.md).
 
-```python
-syrup.add_target("licence_plate", my_plate_detector)   # e.g. a YOLO model, OpenCV, ...
-plates = syrup.ops.find_licence_plates_in_bottom_half_left_to_right("street.jpg")
-```
+Syrup reads a screen the way a person does — "there is a bar here and it is
+about 60% full", "that region moved left", "this text says 1291/1351" —
+without pretending to more certainty than the pixels support. Every result
+carries a confidence, a reliability grade, and a failure reason when nothing
+was found.
 
-Ready-made recipes register whole model vocabularies at once, with model
-files downloaded into the cache and checked against pinned hashes:
+## What is in this repository
 
-```python
-import syrup.recipes
+| path | what | status |
+|---|---|---|
+| `src/` | the library: intents (`intent!`, parse → plan → run/compile), Viola–Jones cascades (bundled face, profile, eye), template matching, connected components, motion and tracking, glyph reading and OCR, `face` and `sequence`, drawing, the C ABI and the C API | 162 unit + 4 native + 3 integration + 3 doc tests; clippy clean |
+| `crates/syrup-runtime/` | operations by name, compiled: grammar, typed plans, code generation, `rustc`, differential validation, artifact store, frozen bundles, sessions; YuNet faces, QR codes, Tesseract words, colour regions and bars, text blocks, panels, motion; the `syrup` CLI | Rust tests with real compiled modules, YuNet checked against OpenCV's; benchmarks |
+| `python/syrup/` | `syrup-cv`: the compiled operations from Python (`syrup.ops`, PyO3 extension in `crates/syrup-python`, abi3 wheels), Python detectors as targets, YOLO and MediaPipe recipes, an optional planner; and `syrup.find_face(image)`, the core's in-process intents over the C API (`syrup.legacy`) | `python/tests` for the operations; 5 for the in-process intents |
+| `python/thelip/` | **The Lip**: lip reading from muted video with live subtitles (syrup finds the mouth, LipNet reads it, decoded again after every frame); demo and proof videos built by `make_demo.sh` and `proof.py` | 64/66 words on the GRID sample clips; 10 tests |
+| `example/lipreader/` | the multi-person pipeline: faces → tracks → mouths → speaking → reading → subtitles per person, three modes, honest language registry, exports, evaluation framework | 25 tests; 0% WER on the composited fixtures |
+| `example/inference-api/` | the local HTTP service (jobs, streamed sessions, exports, deletion, token, rate limit) | 9 tests |
+| `example/chrome-extension/` | Lip Read for YouTube (Manifest V3, TypeScript): overlay, follow a person, side panel, seek, export | 25-check Playwright end-to-end test |
+| `example/web/` | one page over the service | 7-check end-to-end test |
+| `example/thelip/` | **thelip.syrup**: The Lip in the browser, on a phone (the network in a Web Worker, camera or a recorded clip) | engine matches numpy to 2e-6; reads a GRID clip in Chromium |
+| `example/thelip-server/` | any words for thelip.ai: Auto-AVSR's models on your computer, behind a tunnel; Hebrew and better English from thelip-train | routes, languages, learning loop and the worker tested against `--fake`; the English model ran on the owner's PC |
+| `example/thelip-train/` | the training pipeline: licensed video → labels → mouth crops → Auto-AVSR fine-tuning → export, under a budget | CPU stages tested on GRID clips in CI; the GPU stages not run yet |
+| `example/ios/` | the SwiftUI app (Vision, AVFoundation, Core ML, remote backend) | written without a compiler; not built here |
+| `example/minesweeper-coach/` | **a Minesweeper coach** (Rust): watches the game on the screen and says what to do next — the next sure move and why, or the best odds — with the cells marked over the board; never clicks | 34 tests; its advice wins 91% / 81% / 42% of beginner / intermediate / expert games with 0 wrong proofs; reads minesweeper.online screenshots cell for cell; on a Windows runner it watched a game on the screen through and said what the game called for |
+| `example/shared-types/`, `example/ml/`, `example/docs/` | the JSON contract, model scripts behind licence gates, and the design, model survey, benchmarks, API and setup docs | — |
+| `docs/` | the GitHub Pages site, thelip.ai: the thelip.syrup page and the demo GIFs | published to the `gh-pages` branch by `.github/workflows/pages.yml` |
 
-syrup.recipes.yolo()                 # pip install syrup-cv[yolo]: COCO's 80 classes
-syrup.recipes.mediapipe_poses()      # pip install syrup-cv[mediapipe]
-cups = syrup.ops.find_cups_left_to_right("table.jpg")
-people = syrup.ops.track_people.session()
-```
+## The convention
 
-For names outside the grammar, `syrup.define` takes the meaning
-explicitly, and the optional planner asks Claude for it, constrained to
-Syrup's vocabulary and checked like any other definition:
+| Name          | Returns             | Meaning                                   |
+|---------------|---------------------|-------------------------------------------|
+| `find_*`      | `Detection<Vec<Match>>` | zero or more places, strongest first   |
+| `track_*`     | `Detection<Vec<Match>>` | the same, with a stable `id` per object across calls |
+| `count_*`     | `Detection<f32>`    | how many `find_*` would return            |
+| `measure_*`   | `Detection<f32>`    | a percentage or distance                  |
+| `read_*`      | `Detection<String>` | text                                      |
 
-```python
-from syrup.planner import plan
+An empty `find_*` result (`value: Some(vec![])`) means the search ran and
+found nothing. A missing one (`value: None` + `failure_reason`) means it
+could not run. The two are never conflated, and a low-confidence answer is
+reported as missing with its reason rather than as an answer.
 
-find_status_bar = plan("find_status_bar", "the big red bar along the bottom fifth")
-```
+It refuses instead of guessing. Resolution fails, typed and early, when the
+name is outside the vocabulary (`Unparsed`, with the vocabulary as a hint),
+when the meaning is clear but nothing here can carry it out yet
+(`Unsupported`, saying what is missing — a picture of the icon, state for
+tracking), when the declared return type does not fit the verb
+(`WrongShape`), or when a native build or load fails (`BuildFailed` with
+the compiler's log, `LoadFailed`). `syrup::intent::resolve("find_x")` gives
+the typed error up front; a declared function that cannot be resolved
+returns `Detection::missing` with the same reason on every call.
 
-The same mechanism is available from Rust (`syrup_runtime::Runtime`) and
-from the command line:
-
-```sh
-syrup explain find_2_largest_faces_in_center   # what the name means
-syrup source find_face                         # the generated module
-syrup run find_faces photo.jpg --draw out.png  # JSON results
-```
-
-Install with `pip install syrup-cv` (the import is `syrup`), or from a
-checkout with `pip install ./python`. Compiling an operation needs `rustc`
-1.82 or newer. To run on machines without it, build a bundle where a
-compiler is available and ship the directory:
-
-```sh
-syrup bundle ops-bundle find_largest_face find_words   # or syrup.bundle(...)
-SYRUP_MODE=frozen SYRUP_CACHE_DIR=ops-bundle python app.py
-```
-
-Bundles are per platform; a frozen run of an operation that is not in the
-bundle, or a bundle built for another platform, fails with `not_prepared`
-and says which.
-
-[docs/contract.md](docs/contract.md) has the grammar, the result contract
-and every way an operation can fail; [docs/architecture.md](docs/architecture.md)
-the design.
+Vocabulary today — nouns: `face` (frontal, or `profile_face`), `eye`
+(inside faces), `<colour>_bar`, `<colour>_blob`, `text`, `<name>_icon`
+(a picture you register: `intent::register_template("boss", &image)`, or
+`boss.png` in `$SYRUP_TEMPLATES`), `motion`. Verbs: `find`, `track`,
+`count`, `measure` (bars), `read` (text). Qualifiers: colours `red orange
+yellow green cyan blue purple magenta pink`; a position `top bottom left
+right` (that half of the region, before or after the noun); `largest` /
+`smallest` (just that one). So `count_largest_red_blobs_bottom`,
+`track_boss_icon`, `find_eyes` and `measure_green_bar` are all functions
+waiting to be declared. Everything below is what the plans are made of,
+and is available directly.
 
 ## What it does
 
@@ -112,34 +144,163 @@ the design.
   color from the frame instead of assuming it.
 - **Color** — RGB→HSV conversion and the shared pixel predicates (hue-range
   match, "looks like UI text", opacity).
-- **Motion** — single-pass frame differencing plus a centroid tracker that
-  gives moving regions stable IDs, velocity, and occlusion grace.
-- **OCR** — text recognition of small on-screen UI text via a Tesseract
-  subprocess, with automatic crop upscaling (small pixel fonts are
-  otherwise unreadable to it). `ocr::recognize` returns words in image
-  coordinates and says why it failed; the older `ocr_region` is kept for
-  existing callers. On Windows, the OS's built-in OCR engine is also
-  exposed, which is trained on screen content.
+- **Components** — connected-component labelling of masks or pixel
+  predicates: the exact regions, each with bounds, area and centroid, not
+  just the rectangles around them.
+- **Thresholds** — Otsu thresholds, integral images, channel views, and a
+  "text evidence" map that lifts glyph strokes off bars and gradients by
+  comparing each pixel with its own row's background.
+- **Glyph reading** — reads counters and HUD values drawn in a fixed pixel
+  font by matching each glyph against a font learned from a few labelled
+  crops. It is fast, needs no external tools, and refuses to answer when
+  any glyph is ambiguous: an unreadable value comes back as *unknown*,
+  never as a wrong number.
+- **Line reading** — `lines::LineFont` reads a line whose glyphs are not
+  pixel-exact (a video of a HUD, a stream, a HUD stretched by a fraction),
+  where cutting at blank columns fails: the line is covered whole by the
+  characters' pictures (dynamic programming over its columns), each glyph
+  is read again by linear templates, and a reading is refused when its
+  least sure glyph leads by too little, or when it is not of the form the
+  caller says the text has. Learned from labelled lines, with no model;
+  under 20 µs a line on a desktop CPU.
+- **Motion** — single-pass frame differencing plus a tracker that gives
+  moving regions stable IDs, velocity, and occlusion grace. Detections are
+  matched to tracks optimally, so nearby objects do not swap identities.
+- **Template matching** — finds a known picture (an icon, a UI marker, a
+  status glyph) anywhere in a frame by normalised cross-correlation, so
+  brightness and contrast differences don't affect the score. Large
+  searches use a coarse-to-fine image pyramid instead of scoring every
+  position at full resolution; small searches are scored exhaustively.
+  Returns a sub-pixel centre estimate. A `TemplateSet` searches for a
+  thing in several poses, facing either way, with a colour check; a
+  `Prepared` frame shares its pyramids between searches; `find_set_near`
+  is the cheap look where a tracked thing is expected. The inner sums
+  run on `kernels`: AVX2 or SSE2 chosen at run time, the same integers on
+  every path (`SYRUP_SIMD=scalar` forces the plain loops).
+- **Bars** — `bars::BarModel` learns a status bar from one frame (its
+  hue, its track's end) and measures its fill on every frame after.
+- **Cascades** — Viola–Jones boosted cascades of Haar features, evaluated
+  exactly as OpenCV evaluates its cascades, with OpenCV's frontal-face,
+  profile-face and eye detectors bundled (245 KB in all, their licences
+  alongside). Cross-checked against OpenCV on the same photograph: the
+  same face, the same two eyes.
+- **Faces** — once a face is found, where its eyes and mouth are, how open
+  each eye is (blinks) and how open the mouth is (speaking, lip shapes).
+  Proxies for what the pixels show, documented as such.
+- **Sequences** — dynamic time warping and a nearest-example matcher for
+  things that unfold over frames: a mouthed word, a gesture, a pattern of
+  motion. Refuses when two examples are equally close.
+- **OCR** — text recognition via a Tesseract subprocess, with the crop
+  prepared the way Tesseract reads best (dark text on light, levels
+  stretched, enlarged, framed by a margin), per-word confidence and boxes,
+  and a configurable page mode and character whitelist; on Windows, the
+  OS's built-in OCR engine is also exposed, which is trained on screen
+  content.
 - **Quality** — a sharpness metric that predicts whether OCR on a region
   can succeed at all, so blurred input is reported as *blurred* rather than
   silently producing wrong text.
-- **Capture** — live window capture by title. Windows (`PrintWindow`), X11
-  (the Composite extension) and macOS 14+ (ScreenCaptureKit) capture a
-  covered window as drawn; macOS needs the Screen Recording permission. On
-  Wayland the desktop's screen-cast portal asks the user to pick the
-  window once per title and remembers the choice; frames arrive over
-  PipeWire, which is loaded only when used.
+- **Capture** — live window capture by title: on Windows through
+  Windows.Graphics.Capture, the compositor's own frames kept on the GPU
+  and read back whole or a region at a time (`Window::capture_frame`,
+  `Frame::read`), with GDI (`PrintWindow`, then a copy of the screen) as
+  the fallback and `SYRUP_CAPTURE=cpu` to ask for it; the whole screen
+  with where it sits on the desktop; X11, Wayland and macOS windows too.
+  A capture that fails says why (`CaptureError`: minimised, closed, …).
 - **Debug drawing** — rectangles and a dependency-free 5×7 bitmap font for
   annotating frames with what a detector saw.
+- **Timing** — FPS and moving-average measurement.
+
+## Live examples
+
+Both take raw RGBA frames on stdin and write annotated frames to stdout,
+so a webcam, a window or a file reaches them through ffmpeg:
+
+```sh
+ffmpeg -v error -f v4l2 -video_size 640x480 -i /dev/video0 -pix_fmt rgba -f rawvideo - \
+  | cargo run --release --example face_cues -- 640 480 30 \
+  | ffplay -v error -f rawvideo -pix_fmt rgba -video_size 640x480 -
+```
+
+(Windows: `-f dshow -i video="Integrated Camera"`; macOS: `-f avfoundation
+-i "0"`; a file: `-i clip.mp4 -r 15`.)
+
+- `face_cues` — the behavioural signals that "lie detection" folklore
+  points at, measured honestly: blink rate, head motion, gaze shifts, mouth
+  activity, facial motion, each against the person's own first ten seconds.
+  The overlay calls the result arousal, because that is all it is: no
+  measurement of a face tells truth from lies, and this one does not claim
+  to.
+- `lip_reading` — `learn hello 640 480 30` records the mouth's shape and a
+  small normalised picture of it each time you say the word; `read 640 480
+  30` names what you say from the words it has examples of, and shows `?`
+  when two are equally close. Your words, your camera; arbitrary lip
+  reading needs a learned model this library does not have.
+
+## Example projects: lipreader
+
+[`example/`](example/) is the library carrying a product: **lipreader**,
+probabilistic lip reading of one or many visible people — a Chrome
+extension for YouTube (subtitles from the lips over the video, a
+transcript panel, SRT/VTT/JSON/TXT export), a web page, a local inference
+service, the Python pipeline behind them (faces → tracks → mouths →
+speaking → reading, batched, with word-level confidence and `[word?]` for
+doubt), and a native iOS app. English runs today (LipNet, GRID's
+vocabulary); the other languages are surveyed with their licences and wired
+as adapters, not pretended. Measured numbers, tests and the honest status
+of every piece: [`example/README.md`](example/README.md).
+
+## Example project: a Minesweeper coach
+
+[`example/minesweeper-coach`](example/minesweeper-coach) watches a
+Minesweeper game on your screen and talks you through it, the way a friend
+looking over your shoulder would: *"This 1 already has its mine, so the
+green cells around it are safe"*, *"No sure move. Your best bet is the
+yellow cell: about 7 percent risk"*. The board is found and read off the
+screen with syrup's connected components, at any size and anywhere on
+the screen. Every hidden cell's chance of a mine is counted exactly. Its
+marks are drawn over the board in a click-through window that keeps out of
+screen captures, and the voice is the system's own. It never clicks.
+
+## thelip.syrup
+
+The Lip on your phone: **https://thelip.ai/**
+runs the lip reader in the browser (a Web Worker, plain JavaScript, no
+upload, no audio). Point the camera at your mouth, say a sentence from its
+vocabulary, and read it back. Source in [`example/thelip`](example/thelip).
+For **any words**, run [`example/thelip-server`](example/thelip-server)
+on a computer: the page finds it by itself (or a printed link points the
+page at it) and reads with open-vocabulary models running there — English
+(Auto-AVSR on LRS3), Spanish, French, Portuguese, Mandarin (non-commercial
+weights) — every face in the picture on its own, even two people talking
+at once. Readers can keep their sentences, labelled by what the microphone heard
+(speech recognition, so nobody types) and corrected with a tap; that, and
+video whose licence allows it, is what [`example/thelip-train`](example/thelip-train)
+trains on: English adapted to phones, and the first Hebrew lip-reading
+model, which does not exist anywhere yet.
+
+## The Lip
+
+![A muted clip of a person speaking, subtitled live from the lips alone](docs/the-lip.gif)
+
+Lip reading from **muted** video with subtitles that form while the person
+speaks: [`python/thelip`](python/thelip). syrup finds the face and the
+eyes and locates the mouth on every frame; LipNet (Assael et al. 2016),
+run in numpy from its published weights, reads the lips; the prefix seen
+so far is decoded again after every frame. On the eleven GRID sample clips
+that ship with LipNet it reads 64 of 66 words with no audio. It reads
+GRID's 51-word vocabulary, not open English — the README there says
+exactly what it can and cannot do, and how to run it. `proof.py` there
+builds a longer video: each clip muted and then with its sound, a
+fresh-clone session recorded for real, and the code stepped through.
 
 ## What it deliberately does not do
 
 - No input synthesis, no window manipulation, no process inspection: the
   library **reads pixels and reports observations**, nothing else.
-- No trained models in the core: every primitive is deterministic and
-  explainable, which keeps results reproducible in tests. Learned
-  capabilities (YuNet face detection, pinned by SHA-256) live in
-  `syrup-runtime`.
+- No trained models and no model files in the library: every primitive is
+  deterministic and explainable, which keeps results reproducible in
+  tests. (The Lip, in `python/thelip`, is an application that feeds one
+  trained model from the library's face and eye detection, and says so.)
 - No opinion about what an observation *means* — semantics belong to the
   application built on top.
 
@@ -164,6 +325,22 @@ if let Some(bar) = find_color_bar(&image, band, (340.0, 30.0), 0.35, 0.30) {
 # Ok::<(), image::ImageError>(())
 ```
 
+Reading a value drawn in a known pixel font — learn the font once from a
+crop whose text you know, then read new frames:
+
+```rust
+use syrup::glyphs::{GlyphOptions, GlyphSet};
+
+let mut font = GlyphSet::new(GlyphOptions::default());
+font.learn(&labelled_frame, value_region, "1291/1351")?;
+
+let reading = font.read(&frame, value_region);
+match reading.value {
+    Some(text) => println!("{} ({})", text.text, reading.confidence),
+    None => println!("unreadable: {}", reading.failure_reason.unwrap_or_default()),
+}
+```
+
 Frames are plain `image::RgbaImage` buffers, so they can come from a
 screenshot, frames extracted from a video, a synthetic fixture in a test,
 or `syrup::capture` — every primitive behaves identically regardless of
@@ -172,87 +349,204 @@ the source.
 ## Architecture
 
 ```text
-RgbaImage (any source)
+syrup::intent!(fn find_red_bar(image: &RgbaImage) -> Detection<Vec<Match>>)
     │
-    ├─ geometry / color   locate regions by shape and color
-    ├─ motion / tracking  what moved, with stable identity
-    ├─ ocr / quality      what text says, and whether it is readable at all
+    │  intent      parse the name → Intent { Find, [Red], Bar }
+    │              plan            → Plan::ColorBars { Red }
+    │              run             → in-process, or
+    │              compile         → source → cargo (cdylib) → libloading   ─┐
+    ▼                                                                       │ C ABI
+RgbaImage (any source)                                                      │ (abi)
+    │                                                                       │
+    ├─ geometry / color / threshold  locate regions by shape, colour and contrast
+    ├─ bars                          a status bar learned once, measured every frame
+    ├─ components                    the exact connected regions
+    ├─ motion / tracking             what moved, with stable identity
+    ├─ template / cascade            where a known picture, or a face, is
+    ├─ kernels                       the inner sums, at the CPU's vector width
+    ├─ face / sequence               a face's parts and what they do over time
+    ├─ glyphs / ocr / quality        what text says, and whether it is readable at all
+    ├─ lines                         a line read whole when its glyphs are not pixel-exact
     │
     ▼
 Detection<T> — value + confidence + reliability + failure reason
 ```
 
+`capi` exposes the same resolve/run/free cycle as plain C functions when
+the crate is built as a shared library, which is what `python/syrup` calls
+through `ctypes` — and what any other language would.
+
+The primitives are the vocabulary; a plan is a sentence in it. The same
+plan runs in-process or compiled, through the same functions
+(`intent::plans`), so the two can never disagree — the native test checks
+that they don't.
+
 The `Detection<T>` vocabulary is the library's one contract: a detector
 never returns a bare "not found" — it says *why* not, and never returns a
 value without saying *how sure* it is.
 
-## Performance
-
-`cargo bench -p syrup-runtime --bench runtime` measures what an operation
-costs. On a 4-core x86_64 Linux machine:
-
-| | |
-|---|---|
-| first use (generate, compile, validate) | 0.34 s (`find_face`) to 0.57 s (`measure_fill_of_largest_red_bar`) |
-| later uses | loaded from memory or disk, under 1 ms |
-| `find_face`, 1280x720 frame | 90 ms |
-| colour regions and bars, 1280x720 | 12 ms |
-| QR codes / text blocks / panels, 1280x720 | 20 / 12 / 11 ms |
-| `measure_sharpness`, 1280x720 | 4 ms |
-| `track_moving_regions`, per 1200x720 frame | 5 ms |
-
 ## Testing
 
 ```sh
-cargo test --workspace   # core, runtime, and end-to-end face detection
-cargo clippy --workspace --all-targets -- -D warnings
-cargo bench              # criterion benchmarks for the per-frame primitives
+cargo test          # unit, integration and doc tests
+cargo test -- --ignored   # also run OCR against a real Tesseract install
+cargo clippy --all-targets -- -D warnings
+cargo bench         # criterion benchmarks for the per-frame primitives
+cargo run --release --example intents   # declare, run, and compile an intent
+python3 python/test_legacy.py           # the in-process intents from Python, against the built library
+cargo test -p syrup-runtime             # compiled operations: needs rustc on PATH; Tesseract for words
+cargo bench -p syrup-runtime --bench runtime   # what compiling, reusing and running an operation costs
+pip install "./python[test]" && pytest python/tests   # the compiled operations from Python
+tests/portal/run.sh                     # Wayland capture against PipeWire and a stand-in portal
 
-cd python && maturin develop --release && pytest tests
+# The Lip and the example projects (Python 3.11+, ffmpeg, Node 18+ with typescript and playwright)
+example/ml/models/get_lipnet.sh                      # LipNet weights and GRID sample clips (MIT / CC BY 4.0)
+python3 python/thelip/test_thelip.py                 # The Lip
+cd example/lipreader && python3 tests/make_fixtures.py && python3 tests/test_lipreader.py
+cd ../inference-api && python3 tests/test_api.py
+cd ../shared-types && tsc -p tsconfig.json && cd ../chrome-extension && tsc -p tsconfig.json
+NODE_PATH=$(npm root -g) node test/e2e.mjs           # the extension, in Chromium, against the service
+cd ../web && NODE_PATH=$(npm root -g) node test/e2e.mjs
+cd ../thelip && node test/engine.test.mjs && python3 build.py && NODE_PATH=$(npm root -g) node test/page.test.mjs
 ```
 
-The core's tests run against synthetic, in-code fixtures. The runtime's
-compile real modules, so they need `rustc` on the PATH, and detect faces in
-three public-domain and CC0 photographs in `crates/syrup-runtime/tests/fixtures`.
-No network access is needed. OCR tests cover argument construction and
-temp-file hygiene without invoking Tesseract. Nothing in the suite depends
-on a domain edition, so this repository stands alone.
+CI (`.github/workflows/ci.yml`) runs the Rust checks on Linux, Windows and
+macOS (with a window open, so the capture tests capture it), the Python
+package built and installed on all three, Wayland capture and the model
+recipes on Linux, and all of the above on Linux; `wheels.yml` builds and
+tests the wheels and publishes them on a `v*` tag; `pages.yml` publishes
+`docs/` to the `gh-pages` branch, which GitHub Pages serves.
+
+Tests run against synthetic, in-code fixtures plus one public-domain
+photograph (`tests/fixtures`); no network access is required. The native
+intent tests (`tests/intent_native.rs`) build a crate with cargo, which
+takes about a minute the first time and is cached after; set
+`SYRUP_SKIP_NATIVE_TESTS=1` to leave them out. OCR tests cover argument
+construction, TSV parsing, box mapping, preprocessing and temp-file hygiene
+without invoking Tesseract; one opt-in test runs the real engine end to
+end. Nothing in the suite depends on a domain edition, so this repository
+stands alone.
+
+## Performance
+
+Criterion benchmarks on one 1366×768 frame (`cargo bench`; one x86-64
+core, default target features). "Before" is the code as it was extracted
+from MapleSyrup.
+
+| Benchmark                                   | Before  | Now     |
+|---------------------------------------------|--------:|--------:|
+| Motion detection, one moving object         | 6.25 ms | 0.66 ms |
+| Motion detection, whole view panning        | 7.57 ms | 2.12 ms |
+| Colour-bar search in a status band          | 1.18 ms | 0.52 ms |
+| Dominant colour + uniform-panel search      | 3.37 ms | 1.42 ms |
+| Bar-fill measurement                        | 14 µs   | 14 µs   |
+| Connected components, 400 blobs             | —       | 0.72 ms |
+| Text evidence, 124×22 crop                  | —       | 14 µs   |
+| Glyph reading, 9-character value            | —       | 86 µs   |
+| Glyph reading, unreadable 40 px smear       | —       | 0.70 ms |
+| Tracker update, 60 crowded objects          | —       | 38 µs   |
+| Template search, 32 px icon, whole frame    | —       | 15 ms   |
+| Template search, 64 px icon, whole frame    | —       | 7.5 ms  |
+| Template search, 16 px icon, 240×140 region | —       | 1.6 ms  |
+| Face cascade, 320×320 photograph, 1 thread (OpenCV: 91 ms) | — | 116 ms |
+| Face cascade, 320×320 photograph, 2 threads | —  | 80 ms   |
+
+Motion is the slowest when the whole view changes, because no row can be
+skipped; even then it stays well inside a 60 fps frame budget.
+
+The compiled operations (`cargo bench -p syrup-runtime --bench runtime`,
+on a GitHub `ubuntu-latest` runner):
+
+| | |
+|---|---|
+| first use of a name: generate, compile with `rustc`, validate | 0.16 s (`find_face`) to 0.28 s (`measure_fill_of_largest_red_bar`); 0.5–0.66 s on Windows |
+| later uses | 0.02 ms in the same process, 0.6 ms from disk in a new one |
+| `find_face` (YuNet), 1280×720 | 77 ms |
+| red bars or regions, QR codes, text blocks, 1280×720 | 17, 17, 15, 24 ms |
+| panels, sharpness, 1280×720 | 2.2, 3.3 ms |
+| `track_moving_regions`, per 1200×720 frame | 3.0 ms |
+
+The lipreader pipeline's measured speed and accuracy (per fixture, both
+face detectors, stage timings) are in
+[`example/docs/benchmarks.md`](example/docs/benchmarks.md); the cascade is
+the cost there.
+
+**Against OpenCV.** [`bench/vs-opencv`](bench/vs-opencv/RESULTS.md) runs
+Syrup and OpenCV 5.0 over the same held-out inputs, with a pre-registered
+protocol, raw data and one command to reproduce. On one 2-core x86 VM, one
+thread, on 2026-10-12:
+
+- **Motion regions:** the same mask, 3.2× faster at the median.
+- **Haar faces with OpenCV's flat-window rule (`min_deviation`):** 1.19×
+  faster, with the same boxes.
+- **Template matching:** 1.5× faster, but 98.8% of searches correct
+  against OpenCV's 100%.
+- **Haar faces with the default scan:** 0.87× OpenCV's speed.
+- **YuNet:** 5× slower.
+- **Synthetic glyph lines:** behind.
+
+The figures in the table above predate that day's cascade and template
+changes. Those changes made Haar faces 31% and template matching 88%
+faster at the 95th percentile, with the same outputs.
 
 ## Limitations
 
 - The primitives are tuned for rendered UI content (flat colors, pixel
   fonts, hard edges), not for photographs or video of natural scenes.
-- Tesseract must be installed separately for OCR (`TESSERACT_BIN` or
-  `PATH`); without it, OCR reports itself unavailable rather than failing.
-- On Wayland, other applications' window titles are hidden, so the user
-  picks the window the first time a title is used (X11 applications under
-  XWayland are found by title). Desktops whose portal can only share whole
-  screens, such as xdg-desktop-portal-wlr before 0.8, cannot share a
-  window.
-- macOS capture needs macOS 14 or later.
-- Operations by name currently cover faces, printed words, and colour
-  regions and bars. Compiling a new operation needs `rustc` where it first
-  runs, or a bundle prepared elsewhere.
+- Tesseract must be installed separately for OCR (`TESSERACT_BIN`, `PATH`,
+  or the standard Windows install locations); without it, OCR reports
+  itself unavailable rather than failing. Even on clean text it misreads
+  some pixel fonts — prefer the glyph reader wherever the font is fixed.
+- The glyph reader reads one line per region, in fonts it was shown.
+  Learn from whole lines as they appear on screen: glyphs are measured
+  against their line's height, so a slash or a dot learned on its own will
+  not match.
+- The line reader needs labelled lines to learn from (10 at least, 20 or
+  more to fit its refusal level on the fifth it holds out), and a line's
+  form to check (`LineFont::learn_checked`): without one, a glyph the
+  cover leaves out can leave every other glyph sure, and on the pilot's
+  video the margin alone refused every line to stay under 1% wrong.
+- The in-process intents' face detector is OpenCV's frontal cascade:
+  roughly upright, roughly front-on faces of 20 px or more. The compiled
+  operations use YuNet, a learned detector, which scales the frame so its
+  longer side is 640 px: faces much smaller than a thirtieth of the frame's
+  width are missed (search a region, or tile the frame, for crowds).
+- Compiling an intent to a shared library needs `cargo` on the machine at
+  run time; running it in-process (the default) does not. A compiled
+  operation needs `rustc` where it is first used, or a bundle prepared
+  elsewhere (`SYRUP_MODE=frozen`).
+- Window capture needs macOS 14 or later on macOS. On Wayland, other
+  applications' window titles are hidden, so the user picks the window the
+  first time a title is used (X11 applications under XWayland are found by
+  title); desktops whose portal can only share whole screens cannot share a
+  window. Whole-screen capture is Windows-only.
+- The YOLO recipe runs Ultralytics' library and weights, which are AGPL-3.0
+  (or a commercial licence from Ultralytics); Syrup only calls them when you
+  install them. The MediaPipe recipes are Apache-2.0.
 
 ## Syrup and MapleSyrup
 
-Syrup is the generic engine. A domain edition consumes it and adds the
-knowledge Syrup deliberately lacks — what the pixels *mean* in one
-particular application:
+Syrup sees, MapleSyrup understands. Syrup is the generic engine: every
+pixel operation — capture, the bars, the glyphs, the template searches,
+the tracking — and nothing about any one application. A domain edition
+consumes it and adds the knowledge Syrup deliberately lacks — what the
+pixels *mean* there:
 
 ```text
         MapleSyrup            the MapleStory edition
              │                github.com/boggioMichael/ms
-             │ submodule
+             │ Cargo git dependency, pinned to a tag
              ▼
            Syrup              this repository
 ```
 
 [MapleSyrup](https://github.com/boggioMichael/ms) is the first such
 edition, and is where these primitives were developed against real
-captures before being generalised. Syrup itself knows nothing about
-MapleStory, or any other application — a second edition for a different
-program would consume it exactly the same way.
+captures before being generalised; its per-frame path runs on Syrup
+alone, with no vision code of its own and no OCR or model on it. Syrup
+itself knows nothing about MapleStory, or any other application — a
+second edition for a different program would consume it exactly the same
+way.
 
 ## License
 

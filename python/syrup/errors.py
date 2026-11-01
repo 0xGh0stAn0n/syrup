@@ -1,4 +1,4 @@
-"""Failures, named after the stage that produced them (docs/contract.md, section 5)."""
+"""Failures, named after the stage that produced them (crates/syrup-runtime/docs/contract.md, section 5)."""
 
 import json
 

@@ -47,6 +47,7 @@ fn capture_error(e: CaptureError, query: &str) -> SyrupError {
             format!("no window title contains {query:?}"),
         ),
         CaptureError::Closed => (ErrorKind::BadParameter, "the window was closed".into()),
+        CaptureError::Minimised => (ErrorKind::Io, "the window is minimised".into()),
         CaptureError::Unavailable(reason) => (ErrorKind::MissingDependency, reason),
         CaptureError::Denied(reason) => (ErrorKind::PermissionDenied, reason),
         CaptureError::Failed(reason) => (ErrorKind::Io, reason),
@@ -76,7 +77,7 @@ impl WindowCapture {
 
     /// Titles of the windows that can be captured without asking the user.
     pub fn windows() -> Result<Vec<String>> {
-        syrup::capture::list_windows().map_err(|e| capture_error(e, ""))
+        syrup::capture::window_titles().map_err(|e| capture_error(e, ""))
     }
 }
 

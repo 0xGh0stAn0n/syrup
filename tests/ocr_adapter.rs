@@ -1,6 +1,6 @@
 //! `ocr_region` is kept as a transitional adapter for existing callers. These
-//! pin its behaviour: words in the upscaled crop's pixels, `None` for no text
-//! and for failures. It runs against a fake Tesseract via TESSERACT_BIN, so
+//! pin its behaviour: words in the crop's pixels, `None` for no text and for
+//! failures. It runs against a fake Tesseract via TESSERACT_BIN, so
 //! it needs no installed engine.
 #![cfg(unix)]
 
@@ -45,24 +45,20 @@ fn ocr_region_keeps_its_old_behaviour() {
     assert_eq!(old.text, "HP 1291/1351");
     assert!(old.available);
     let first = &old.words[0];
-    assert_eq!(
-        (first.x, first.y, first.w, first.h),
-        (40, 8, 80, 32),
-        "upscaled crop pixels"
-    );
-
     let new = recognize(&image, region, &OcrConfig::default()).unwrap();
     assert_eq!(new.text, old.text);
+    // The same word: relative to the crop from ocr_region, in the image's
+    // pixels from recognize.
     assert_eq!(
         new.words[0].bounds,
         Rect {
-            x: 20,
-            y: 22,
-            w: 20,
-            h: 8
+            x: region.x + first.x,
+            y: region.y + first.y,
+            w: first.w,
+            h: first.h
         },
-        "image pixels"
     );
+    assert!(first.x + first.w <= region.w && first.y + first.h <= region.h);
 
     let silent = fake_tesseract("silent", "echo 'level\tpage_num'");
     unsafe { std::env::set_var("TESSERACT_BIN", &silent) };

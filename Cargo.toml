@@ -4,12 +4,27 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "A small toolkit for turning captured frames into structured, confidence-scored visual observations"
-repository = "https://github.com/0xGh0stAn0n/syrup"
+repository = "https://github.com/boggioMichael/syrup"
 keywords = ["computer-vision", "screen-capture", "ocr", "detection"]
 categories = ["computer-vision", "multimedia::images"]
 
+[lib]
+# The rlib for Rust callers; the cdylib carries the C API (src/capi.rs)
+# that the Python package's in-process intents and other hosts load.
+crate-type = ["rlib", "cdylib"]
+
+[features]
+# `serde` derives for the types a consumer keeps between runs (a learned
+# bar, a box as fractions of the frame).
+serde = ["dep:serde"]
+# The inner kernels exposed for timing them on their own (`syrup::bench`);
+# not a stable API.
+bench-internals = []
+
 [dependencies]
 image = "0.24"
+libloading = "0.9"
+serde = { version = "1", features = ["derive"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
@@ -21,13 +36,29 @@ windows = { version = "0.61", features = [
     "Graphics_Imaging",
     "Storage_Streams",
     "Foundation",
+    # Windows.Graphics.Capture: the compositor's frames on the GPU.
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Security_Authorization_AppCapabilityAccess",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_UI_HiDpi",
 ] }
 
+# Window capture on Linux and the BSDs: X11 directly, Wayland through the
+# desktop's screen-cast portal (D-Bus) and PipeWire (loaded when used).
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
-libloading = "0.9"
 x11rb = { version = "0.14", features = ["composite"] }
 zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
 
+# Window capture on macOS 14 and later: ScreenCaptureKit.
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
 objc2 = "0.6"
@@ -54,14 +85,15 @@ x11rb = "0.14"
 name = "primitives"
 harness = false
 
-# The core stays a standalone package at the root, so path and submodule
-# consumers keep working. The runtime that turns intents into compiled
-# native operations is a separate member; the Python extension is built by
-# maturin with its own lockfile (it links against Python, which a plain
-# `cargo test --workspace` should not need).
+# The core stays a standalone package at the root, so path consumers keep
+# working. Operations by name — parsed, generated, compiled with rustc,
+# validated and loaded — live in crates/syrup-runtime. The Python extension
+# is built by maturin with its own lockfile (it links against Python, which
+# a plain `cargo test --workspace` should not need), and the Minesweeper
+# coach is a separate example with its own lockfile.
 [workspace]
 members = ["crates/syrup-runtime"]
-exclude = ["crates/syrup-python"]
+exclude = ["crates/syrup-python", "example/minesweeper-coach"]
 
 # Face detection runs in tests; unoptimised tract makes them crawl.
 [profile.dev]

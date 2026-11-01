@@ -1,0 +1,1670 @@
+//! Reading short lines of pixel-font text by template matching.
+//!
+//! On-screen counters, HUD values and labels are drawn in one fixed font at
+//! one of a handful of sizes. A general OCR engine is trained on documents
+//! and misreads such text badly, and it costs a process launch per call.
+//! This reader learns the font from labelled examples instead — show it a
+//! crop and tell it what the crop says — and then reads new crops by
+//! matching each glyph against what it learned:
+//!
+//! ```text
+//!   crop ─▶ text evidence (brighter than its row's background)
+//!        ─▶ text band (the rows the line occupies)
+//!        ─▶ glyph columns (runs of inked columns; wide runs are split)
+//!        ─▶ each glyph resized to a fixed cell ─▶ best template + margin
+//! ```
+//!
+//! Every glyph reports its score and its margin over the best *other*
+//! character. [`GlyphSet::read`] refuses to answer when any glyph is not
+//! clearly one character, because a confident wrong number is worse than an
+//! admitted "unknown"; [`GlyphSet::read_all`] returns the full breakdown
+//! for callers that want to inspect uncertain readings themselves.
+//!
+//! Glyphs are normalised to the line height, so a font learned at one size
+//! also reads the same font rendered at another.
+
+use std::collections::HashMap;
+
+use image::{GrayImage, RgbaImage};
+
+use crate::detection::{Confidence, Detection, Reliability};
+use crate::geometry::Rect;
+use crate::threshold::{Channel, Polarity, text_evidence};
+
+/// Height of the normalised glyph cell, in cells.
+const CELL_H: usize = 16;
+/// Width of the normalised glyph cell; wide enough for any glyph whose
+/// width is at most its height.
+const CELL_W: usize = 16;
+
+/// Tuning for how text is separated from its background and how sure a
+/// match must be.
+#[derive(Debug, Clone, Copy)]
+pub struct GlyphOptions {
+    /// Which view of the pixel to measure. [`Channel::Min`] suits light text
+    /// on coloured bars; [`Channel::Luma`] suits text on grey panels.
+    pub channel: Channel,
+    pub polarity: Polarity,
+    /// Levels above the row background at which a stroke counts fully.
+    pub evidence_span: u8,
+    /// Evidence (0-255) at or above which a pixel is ink.
+    pub ink_threshold: u8,
+    /// Minimum normalised correlation for a glyph to count as recognised.
+    pub min_score: f32,
+    /// Minimum lead of the best character over the best other character.
+    pub min_margin: f32,
+    /// Blank columns narrower than this do not separate glyphs. The
+    /// default, 1, splits at every blank column, which suits connected
+    /// pixel fonts. Segmented fonts (seven-segment counters, dotted LED
+    /// displays) carry blank columns *inside* a glyph; setting this to the
+    /// widest such gap plus one keeps each digit whole while the wider gaps
+    /// between digits still split.
+    pub min_gap: u32,
+}
+
+impl Default for GlyphOptions {
+    fn default() -> Self {
+        Self {
+            channel: Channel::Min,
+            polarity: Polarity::LightText,
+            evidence_span: 60,
+            ink_threshold: 100,
+            min_score: 0.72,
+            min_margin: 0.06,
+            min_gap: 1,
+        }
+    }
+}
+
+/// One recognised (or unrecognised) glyph.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GlyphMatch {
+    /// The best-matching character.
+    pub ch: char,
+    /// Where the glyph was found, in image coordinates.
+    pub bounds: Rect,
+    /// Normalised correlation with the best template, in `[-1, 1]`.
+    pub score: f32,
+    /// `score` minus the best score of any other character.
+    pub margin: f32,
+}
+
+/// A line read glyph by glyph.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextReading {
+    /// The characters in reading order; a space marks a wide gap.
+    pub text: String,
+    pub glyphs: Vec<GlyphMatch>,
+}
+
+/// Why a labelled example could not be learned from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LearnError {
+    /// No text-like pixels were found in the region.
+    NoText,
+    /// The crop splits into a different number of glyphs than the label
+    /// has characters.
+    GlyphCountMismatch { expected: usize, found: usize },
+    /// A character the label uses twice looks different each time: the
+    /// region is not that text (noise, or the wrong line, or the wrong
+    /// label), however many glyphs it split into.
+    Inconsistent { ch: char, correlation: f32 },
+    /// Learned on trial, the font did not read the region back as the
+    /// label: `read` is what it gave. Nothing was kept.
+    DoesNotReadBack { read: String },
+}
+
+impl std::fmt::Display for LearnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LearnError::NoText => write!(f, "no text found in the region"),
+            LearnError::GlyphCountMismatch { expected, found } => write!(
+                f,
+                "the label has {expected} characters but the region splits into {found} glyphs"
+            ),
+            LearnError::Inconsistent { ch, correlation } => write!(
+                f,
+                "the two {ch:?} in the label look nothing alike in the region (correlation {correlation:.2})"
+            ),
+            LearnError::DoesNotReadBack { read } => {
+                write!(
+                    f,
+                    "learned on trial, the font reads the region as {read:?}, not the label"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for LearnError {}
+
+#[derive(Debug, Clone)]
+struct Template {
+    ch: char,
+    /// Running mean of the normalised cells learned for this character.
+    cell: Vec<f32>,
+    /// `cell` centred and scaled to unit length, so that matching a glyph
+    /// against it is a single dot product (see [`Standardised`]).
+    unit: Standardised,
+    samples: u32,
+    /// The height of the line it was learned from: a pixel font drawn at
+    /// two sizes is two fonts (the strokes do not scale), and a glyph is
+    /// matched against the templates of its own size when there are any.
+    height: u32,
+}
+
+/// Two line heights within this share of the taller are the same size of
+/// the font.
+const SAME_SIZE_WITHIN: f32 = 0.2;
+
+fn same_size(a: u32, b: u32) -> bool {
+    (a as f32 - b as f32).abs() <= SAME_SIZE_WITHIN * a.max(b) as f32
+}
+
+/// A font learned from labelled examples.
+///
+/// ```
+/// use image::{Rgba, RgbaImage};
+/// use syrup::draw;
+/// use syrup::geometry::Rect;
+/// use syrup::glyphs::{GlyphOptions, GlyphSet};
+///
+/// // A value drawn in a pixel font, light on a coloured bar.
+/// fn crop(text: &str) -> (RgbaImage, Rect) {
+///     let (w, h) = (draw::text_width(text, 2) + 16, draw::text_height(2) + 8);
+///     let mut image = RgbaImage::from_pixel(w, h, Rgba([40, 90, 200, 255]));
+///     draw::draw_text(text, 8, 4, 2, |x, y| {
+///         image.put_pixel(x as u32, y as u32, Rgba([245, 245, 245, 255]))
+///     });
+///     (image, Rect { x: 0, y: 0, w, h })
+/// }
+///
+/// // Teach it the font from a crop whose text is known...
+/// let mut font = GlyphSet::new(GlyphOptions::default());
+/// let (example, region) = crop("0123456789/");
+/// font.learn(&example, region, "0123456789/")?;
+///
+/// // ...then read new crops. `read` abstains rather than guess.
+/// let (frame, region) = crop("1291/1351");
+/// let reading = font.read(&frame, region);
+/// assert_eq!(reading.value.map(|r| r.text).as_deref(), Some("1291/1351"));
+///
+/// // A character it never learned makes the whole reading unknown.
+/// let (frame, region) = crop("12%");
+/// assert!(!font.read(&frame, region).is_present());
+/// # Ok::<(), syrup::glyphs::LearnError>(())
+/// ```
+#[derive(Debug, Clone)]
+pub struct GlyphSet {
+    options: GlyphOptions,
+    templates: Vec<Template>,
+}
+
+impl GlyphSet {
+    pub fn new(options: GlyphOptions) -> Self {
+        Self {
+            options,
+            templates: Vec::new(),
+        }
+    }
+
+    pub fn options(&self) -> &GlyphOptions {
+        &self.options
+    }
+
+    /// Characters learned so far (each once, however many sizes it was
+    /// learned at).
+    pub fn chars(&self) -> impl Iterator<Item = char> + '_ {
+        self.templates
+            .iter()
+            .enumerate()
+            .filter(|(i, t)| !self.templates[..*i].iter().any(|o| o.ch == t.ch))
+            .map(|(_, t)| t.ch)
+    }
+
+    /// Learn from `region` of `image`, which shows exactly `label` (spaces
+    /// in the label are ignored). Returns the number of glyphs learned.
+    ///
+    /// Repeated examples of a character are averaged, so learning from
+    /// several captures makes the templates robust to the noise of any one.
+    ///
+    /// Glyphs are measured against the height of their line, which is what
+    /// tells a dash from an underscore. Learn from whole lines as they
+    /// appear on screen: a character that does not reach the full height
+    /// (a slash, a dot, a dash) learned from a crop of its own is measured
+    /// against its own height instead, and will not match in a real line.
+    ///
+    /// An example is checked before it is kept: a character the label uses
+    /// twice must look alike both times, and the font with the example
+    /// learned (on trial) must read the region back as the label, every
+    /// glyph as surely as [`GlyphSet::read`] demands. A region of noise, the
+    /// wrong line, or a label that is not what the pixels say can all be
+    /// cut into as many pieces as the label has characters; none of them
+    /// reads back, and none of them is learned.
+    pub fn learn(
+        &mut self,
+        image: &RgbaImage,
+        region: Rect,
+        label: &str,
+    ) -> Result<usize, LearnError> {
+        let expected: Vec<char> = label.chars().filter(|c| !c.is_whitespace()).collect();
+        let line = Line::extract(image, region, &self.options).ok_or(LearnError::NoText)?;
+        let spans = fit_span_count(&line, line.spans(), expected.len());
+        if spans.len() != expected.len() {
+            return Err(LearnError::GlyphCountMismatch {
+                expected: expected.len(),
+                found: spans.len(),
+            });
+        }
+        let cells: Vec<(char, Vec<f32>)> = spans
+            .iter()
+            .zip(&expected)
+            .map(|(&(x0, x1), &ch)| (ch, line.cell(x0, x1)))
+            .collect();
+        // The same character must look the same wherever it appears.
+        for (i, (ch, cell)) in cells.iter().enumerate() {
+            let unit = Standardised::new(cell);
+            for (other, cell) in &cells[..i] {
+                if other == ch {
+                    let correlation = unit.correlation(&Standardised::new(cell));
+                    if correlation < SAME_CHARACTER_AGREEMENT {
+                        return Err(LearnError::Inconsistent {
+                            ch: *ch,
+                            correlation,
+                        });
+                    }
+                }
+            }
+        }
+        // On trial first: the font with this example in it must read the
+        // region back as the label.
+        let mut trial = self.templates.clone();
+        for (ch, cell) in &cells {
+            Self::absorb(&mut trial, *ch, cell, line.height);
+        }
+        let on_trial = GlyphSet {
+            options: self.options,
+            templates: trial,
+        };
+        let read = on_trial.read(image, region);
+        let agrees = read.value.as_ref().is_some_and(|r| {
+            r.text
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .eq(expected.iter().copied())
+        });
+        if !agrees {
+            return Err(LearnError::DoesNotReadBack {
+                read: read
+                    .value
+                    .map(|r| r.text)
+                    .or_else(|| {
+                        on_trial
+                            .read_all(image, region)
+                            .map(|r| format!("{} (not surely)", r.text))
+                    })
+                    .unwrap_or_default(),
+            });
+        }
+        self.templates = on_trial.templates;
+        Ok(expected.len())
+    }
+
+    /// One more example of `ch`, from a line `height` tall, into
+    /// `templates`: averaged into its template of that size, or a new
+    /// template.
+    fn absorb(templates: &mut Vec<Template>, ch: char, cell: &[f32], height: u32) {
+        match templates
+            .iter_mut()
+            .find(|t| t.ch == ch && same_size(t.height, height))
+        {
+            Some(template) => {
+                template.samples += 1;
+                let n = template.samples as f32;
+                for (mean, value) in template.cell.iter_mut().zip(cell) {
+                    *mean += (value - *mean) / n;
+                }
+                template.unit = Standardised::new(&template.cell);
+                // The size settles on what it has seen.
+                template.height =
+                    (template.height * (template.samples - 1) + height) / template.samples;
+            }
+            None => templates.push(Template {
+                ch,
+                unit: Standardised::new(cell),
+                cell: cell.to_vec(),
+                samples: 1,
+                height,
+            }),
+        }
+    }
+
+    /// Read `region`, glyph by glyph, whatever the confidence.
+    pub fn read_all(&self, image: &RgbaImage, region: Rect) -> Option<TextReading> {
+        if self.templates.is_empty() {
+            return None;
+        }
+        let line = Line::extract(image, region, &self.options)?;
+        let mut glyphs = Vec::new();
+        let mut text = String::new();
+        let mut previous_end: Option<u32> = None;
+        let space_gap = (line.height as f32 * SPACE_GAP_FRACTION).ceil() as u32;
+
+        for (x0, x1) in line.spans() {
+            // A run that matches no single glyph well may be two or three
+            // glyphs touching; take whichever split reads best.
+            let pieces = self.best_split(&line, x0, x1);
+            for (a, b) in pieces {
+                if let Some(end) = previous_end
+                    && a.saturating_sub(end) >= space_gap
+                {
+                    text.push(' ');
+                }
+                let found = self.classify(&line.cell(a, b), line.height);
+                text.push(found.0);
+                glyphs.push(GlyphMatch {
+                    ch: found.0,
+                    bounds: Rect {
+                        x: line.origin.0 + a,
+                        y: line.origin.1 + line.top,
+                        w: b - a,
+                        h: line.height,
+                    },
+                    score: found.1,
+                    margin: found.2,
+                });
+                previous_end = Some(b);
+            }
+        }
+        (!glyphs.is_empty()).then_some(TextReading { text, glyphs })
+    }
+
+    /// Read `region`, or explain why it could not be read with confidence.
+    ///
+    /// The confidence of a successful reading is that of its least certain
+    /// glyph. Any glyph below [`GlyphOptions::min_score`] or
+    /// [`GlyphOptions::min_margin`] makes the whole reading missing: one
+    /// wrong digit makes a number wrong.
+    pub fn read(&self, image: &RgbaImage, region: Rect) -> Detection<TextReading> {
+        let Some(reading) = self.read_all(image, region) else {
+            return Detection::missing("glyphs", "no glyphs found in the region");
+        };
+        let weakest =
+            reading.glyphs.iter().enumerate().find(|(_, g)| {
+                g.score < self.options.min_score || g.margin < self.options.min_margin
+            });
+        if let Some((index, glyph)) = weakest {
+            return Detection::missing(
+                "glyphs",
+                format!(
+                    "glyph {index} is not clearly one character (best {:?}, score {:.2}, margin {:.2}); read {:?}",
+                    glyph.ch, glyph.score, glyph.margin, reading.text
+                ),
+            );
+        }
+        let confidence = reading
+            .glyphs
+            .iter()
+            .map(|g| {
+                let score = (g.score - self.options.min_score) / (1.0 - self.options.min_score);
+                let margin = g.margin / (2.0 * self.options.min_margin);
+                (0.5 + 0.5 * score.min(margin)).clamp(0.0, 1.0)
+            })
+            .fold(1.0f32, f32::min);
+        Detection::found(
+            reading,
+            Confidence::new(confidence),
+            "glyphs",
+            Reliability::Heuristic,
+        )
+    }
+
+    /// Best character for a normalised cell from a line `height` tall:
+    /// `(char, score, margin)`. Only the templates of that size are asked
+    /// when there are any; a size never learned is read with all of them.
+    fn classify(&self, cell: &[f32], height: u32) -> (char, f32, f32) {
+        let cell = Standardised::new(cell);
+        let mut best = (' ', -1.0f32);
+        let mut second = -1.0f32;
+        let own_size = self.templates.iter().any(|t| same_size(t.height, height));
+        for template in &self.templates {
+            if own_size && !same_size(template.height, height) {
+                continue;
+            }
+            let score = cell.correlation(&template.unit);
+            if score > best.1 {
+                if best.0 != template.ch {
+                    second = second.max(best.1);
+                }
+                best = (template.ch, score);
+            } else if template.ch != best.0 {
+                second = second.max(score);
+            }
+        }
+        (best.0, best.1, best.1 - second.max(-1.0))
+    }
+
+    /// Split `x0..x1` into one, two or three glyphs, whichever makes the
+    /// weakest piece score highest. A single glyph is kept unless a split
+    /// is clearly better, so a well-matched wide glyph is never cut up.
+    ///
+    /// Cut positions are chosen by the templates, not by the ink profile:
+    /// where two glyphs touch, the least-inked column is usually *inside* a
+    /// glyph (the waist of an 8), and cutting there reads neither half.
+    ///
+    /// The search only considers pieces a glyph could fill — at most
+    /// [`MAX_GLYPH_ASPECT`] times the line height wide — and scores each
+    /// distinct piece once, so a wide smear of unreadable ink costs about as
+    /// much as a few glyphs rather than growing with the square of its width.
+    fn best_split(&self, line: &Line, x0: u32, x1: u32) -> Vec<(u32, u32)> {
+        let whole = self.classify(&line.cell(x0, x1), line.height);
+        if whole.1 >= self.options.min_score || x1 - x0 < 4 {
+            return vec![(x0, x1)];
+        }
+        let widest = ((line.height as f32 * MAX_GLYPH_ASPECT).ceil() as u32).max(2);
+        let mut scores: HashMap<(u32, u32), Option<ScoredPiece>> = HashMap::new();
+        let mut score = |a: u32, b: u32| -> Option<ScoredPiece> {
+            if b - a > widest {
+                return None;
+            }
+            *scores.entry((a, b)).or_insert_with(|| {
+                let (a, b) = line.trim_columns(a, b)?;
+                Some(((a, b), self.classify(&line.cell(a, b), line.height).1))
+            })
+        };
+        let mut best = (vec![(x0, x1)], whole.1);
+
+        // A split is only believed when its weakest piece beats the best so
+        // far by SPLIT_ADVANTAGE, so any piece scoring below that bar rules
+        // out every split containing it without scoring the rest.
+        let bar = |best: f32| best + SPLIT_ADVANTAGE;
+
+        // Two pieces, each at least two columns wide.
+        if x1 - x0 <= 2 * widest {
+            for cut in (x0 + 2).max(x1.saturating_sub(widest))..=(x1 - 2).min(x0 + widest) {
+                let Some((p, sp)) = score(x0, cut) else {
+                    continue;
+                };
+                if sp <= bar(best.1) {
+                    continue;
+                }
+                if let Some((q, sq)) = score(cut, x1)
+                    && sp.min(sq) > bar(best.1)
+                {
+                    best = (vec![p, q], sp.min(sq));
+                }
+            }
+        }
+        if best.1 >= self.options.min_score || x1 - x0 < 6 || x1 - x0 > 3 * widest {
+            return best.0;
+        }
+
+        // Three pieces, only when two did not already explain the run.
+        for first in x0 + 2..=(x1 - 4).min(x0 + widest) {
+            let Some((p, sp)) = score(x0, first) else {
+                continue;
+            };
+            for second in (first + 2).max(x1.saturating_sub(widest))..=(x1 - 2).min(first + widest)
+            {
+                if sp <= bar(best.1) {
+                    break;
+                }
+                let Some((q, sq)) = score(first, second) else {
+                    continue;
+                };
+                if sq <= bar(best.1) {
+                    continue;
+                }
+                if let Some((r, sr)) = score(second, x1)
+                    && sp.min(sq).min(sr) > bar(best.1)
+                {
+                    best = (vec![p, q, r], sp.min(sq).min(sr));
+                }
+            }
+        }
+        best.0
+    }
+}
+
+/// A candidate glyph after trimming — its columns `(x0, x1)` — and how well
+/// it matches its best character.
+type ScoredPiece = ((u32, u32), f32);
+
+/// How alike two cells of the same character in one labelled example must
+/// be for the example to be believed: the same glyph drawn twice in one
+/// line correlates near 1; two patches of noise, or two glyphs that are
+/// not the ones the label says, near 0.
+const SAME_CHARACTER_AGREEMENT: f32 = 0.5;
+
+/// Widest glyph a split may produce, as a multiple of the line height.
+/// Glyph cells are square, so wider pieces would be squeezed to fit anyway.
+const MAX_GLYPH_ASPECT: f32 = 1.5;
+
+/// A gap of at least this fraction of the line height reads as a space.
+const SPACE_GAP_FRACTION: f32 = 0.5;
+
+/// How much better the weakest piece of a split must score than the
+/// unsplit run before the split is believed.
+const SPLIT_ADVANTAGE: f32 = 0.05;
+
+/// A filled square of ink this fraction of the line height on a side (and
+/// at least [`MIN_BLOCK_SIDE`] pixels) is a block, not a glyph: the empty
+/// track of a bar beside its fill, a panel's edge. No readable font has a
+/// stroke that thick.
+const BLOCK_SIDE: f32 = 0.5;
+const MIN_BLOCK_SIDE: u32 = 3;
+
+/// How many times, at most, the band is narrowed to the rows of its own
+/// glyphs. Each pass can only shrink it, and two usually settle it.
+const BAND_PASSES: usize = 4;
+
+/// The tallest run of `true` in `inked`, allowing a single-row gap (the dot
+/// of an i, the gap in a colon), as half-open `(start, end)`.
+fn tallest_run(inked: &[bool]) -> Option<(u32, u32)> {
+    let height = inked.len();
+    let mut best: Option<(usize, usize)> = None;
+    let mut y = 0;
+    while y < height {
+        if !inked[y] {
+            y += 1;
+            continue;
+        }
+        let start = y;
+        let mut end = y + 1;
+        while end < height && (inked[end] || (end + 1 < height && inked[end + 1])) {
+            end += 1;
+        }
+        if best.is_none_or(|(s, e)| end - start > e - s) {
+            best = Some((start, end));
+        }
+        y = end;
+    }
+    best.map(|(s, e)| (s as u32, e as u32))
+}
+
+/// The text band of a region: evidence rows the line occupies, and which
+/// columns hold ink.
+struct Line {
+    origin: (u32, u32),
+    /// Evidence for the whole region, 0-255.
+    evidence: GrayImage,
+    top: u32,
+    height: u32,
+    ink_threshold: u8,
+    /// See [`GlyphOptions::min_gap`].
+    min_gap: u32,
+    /// Ink pixels per column within the band, for every column: counted
+    /// once for the band, where each glyph tried used to count its own.
+    ink: Vec<u32>,
+    /// A cell's rows as taps of the band's rows: the same for every glyph
+    /// of the line.
+    rows: BoxTaps,
+    /// The band's evidence as floats, column by column (`height` values a
+    /// column): what every glyph tried resamples, converted once.
+    columns: Vec<f32>,
+}
+
+impl Line {
+    fn extract(image: &RgbaImage, region: Rect, options: &GlyphOptions) -> Option<Self> {
+        let evidence = text_evidence(
+            image,
+            region,
+            options.channel,
+            options.polarity,
+            options.evidence_span,
+        );
+        let (width, height) = evidence.dimensions();
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let threshold = options.ink_threshold;
+        // Rows carrying ink; the line is the tallest run of them, allowing a
+        // one-row gap (the dot of an i, the gap in a colon).
+        let inked: Vec<bool> = (0..height)
+            .map(|y| (0..width).any(|x| evidence.get_pixel(x, y).0[0] >= threshold))
+            .collect();
+        let (top, bottom) = tallest_run(&inked)?;
+        let mut line = Self {
+            origin: (region.x, region.y),
+            evidence,
+            top,
+            height: bottom - top,
+            ink_threshold: threshold,
+            min_gap: options.min_gap.max(1),
+            ink: Vec::new(),
+            rows: BoxTaps::new(0, 0, 0),
+            columns: Vec::new(),
+        };
+        line.set_band(top, bottom - top);
+        // That band took every inked row, and a bar's end or the empty track
+        // beside its fill stands taller than the writing on it. Narrow the
+        // band to the rows of the writing itself — the spans that survive,
+        // blocks and debris dropped — until it holds still, so a line is
+        // measured the same with and without such company.
+        for _ in 0..BAND_PASSES {
+            let spans = line.spans();
+            let Some((top, bottom)) = line.band_of(&spans) else {
+                break;
+            };
+            if (top, bottom) == (line.top, line.top + line.height) {
+                break;
+            }
+            line.set_band(top, bottom - top);
+        }
+        Some(line)
+    }
+
+    /// The band becomes rows `top .. top + height`: its ink per column
+    /// counted and its cell rows' taps made.
+    fn set_band(&mut self, top: u32, height: u32) {
+        self.top = top;
+        self.height = height;
+        let width = self.evidence.width() as usize;
+        let mut ink = vec![0u32; width];
+        if width > 0 {
+            for row in self
+                .evidence
+                .as_raw()
+                .chunks_exact(width)
+                .skip(top as usize)
+                .take(height as usize)
+            {
+                for (count, &value) in ink.iter_mut().zip(row) {
+                    *count += u32::from(value >= self.ink_threshold);
+                }
+            }
+        }
+        self.ink = ink;
+        self.rows = BoxTaps::new(height, CELL_H, height);
+        let (h, mut columns) = (height as usize, vec![0.0f32; width * height as usize]);
+        if width > 0 {
+            for (sy, row) in self
+                .evidence
+                .as_raw()
+                .chunks_exact(width)
+                .skip(top as usize)
+                .take(h)
+                .enumerate()
+            {
+                for (x, &value) in row.iter().enumerate() {
+                    columns[x * h + sy] = f32::from(value);
+                }
+            }
+        }
+        self.columns = columns;
+    }
+
+    fn is_ink(&self, x: u32, y: u32) -> bool {
+        self.evidence.get_pixel(x, y).0[0] >= self.ink_threshold
+    }
+
+    /// Ink pixels per column over `x0..x1`, within the band.
+    fn column_ink(&self, x0: u32, x1: u32) -> &[u32] {
+        &self.ink[x0 as usize..x1 as usize]
+    }
+
+    /// Runs of inked columns within the band, as half-open `(x0, x1)`.
+    fn spans(&self) -> Vec<(u32, u32)> {
+        let ink = self.column_ink(0, self.evidence.width());
+        let mut spans: Vec<(u32, u32)> = Vec::new();
+        let mut start = None;
+        for (x, &count) in ink.iter().enumerate() {
+            match (count > 0, start) {
+                (true, None) => start = Some(x as u32),
+                (false, Some(s)) => {
+                    spans.push((s, x as u32));
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(s) = start {
+            spans.push((s, ink.len() as u32));
+        }
+        // Gaps narrower than `min_gap` are inside a glyph, not between two.
+        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(spans.len());
+        for span in spans {
+            match merged.last_mut() {
+                Some(last) if span.0 - last.1 < self.min_gap => last.1 = span.1,
+                _ => merged.push(span),
+            }
+        }
+        // A block of ink is not writing: the empty track of a bar beside its
+        // fill, lighter than the fill the text sits on, or a panel's edge.
+        merged.retain(|&(a, b)| !self.holds_block(a, b));
+        self.main_cluster(merged, ink)
+    }
+
+    /// Whether columns `a..b` of the band hold a filled square of ink
+    /// [`BLOCK_SIDE`] of the line height on a side. No readable font has a
+    /// stroke that thick, so a span holding one is a block of lighter
+    /// background, not a glyph.
+    fn holds_block(&self, a: u32, b: u32) -> bool {
+        let side = ((self.height as f32 * BLOCK_SIDE).ceil() as u32).max(MIN_BLOCK_SIDE);
+        let (w, h) = (b - a, self.height);
+        if w < side || h < side {
+            return false;
+        }
+        // Prefix sums of the ink over the span, so any square is summed in
+        // four lookups.
+        let (w, h, side) = (w as usize, h as usize, side as usize);
+        let stride = w + 1;
+        let mut sums = vec![0u32; stride * (h + 1)];
+        for y in 0..h {
+            let mut row = 0;
+            for x in 0..w {
+                row += u32::from(self.is_ink(a + x as u32, self.top + y as u32));
+                sums[(y + 1) * stride + x + 1] = sums[y * stride + x + 1] + row;
+            }
+        }
+        let at = |x: usize, y: usize| sums[y * stride + x];
+        let full = (side * side) as u32;
+        (0..=h - side).any(|y| {
+            (0..=w - side).any(|x| {
+                // Inclusion-exclusion, added before subtracted so it never
+                // dips below zero on the way.
+                at(x + side, y + side) + at(x, y) - at(x, y + side) - at(x + side, y) == full
+            })
+        })
+    }
+
+    /// The rows of the band that `spans` ink, as the tallest run of them
+    /// (allowing a one-row gap), in image rows.
+    fn band_of(&self, spans: &[(u32, u32)]) -> Option<(u32, u32)> {
+        let inked: Vec<bool> = (self.top..self.top + self.height)
+            .map(|y| {
+                spans
+                    .iter()
+                    .any(|&(a, b)| (a..b).any(|x| self.is_ink(x, y)))
+            })
+            .collect();
+        tallest_run(&inked).map(|(start, end)| (self.top + start, self.top + end))
+    }
+
+    /// Keep only the line itself: the group of runs with the most ink,
+    /// where groups are separated by gaps wider than twice the line height.
+    ///
+    /// A region drawn around a value usually also catches the ends of the
+    /// bar or panel it sits on — short bright slivers well away from the
+    /// text. Word spacing is far narrower than that gap, so the text stays
+    /// together while the debris at the edges is dropped.
+    fn main_cluster(&self, spans: Vec<(u32, u32)>, ink: &[u32]) -> Vec<(u32, u32)> {
+        let limit = self.height.saturating_mul(2).max(4);
+        let mut groups: Vec<Vec<(u32, u32)>> = Vec::new();
+        for span in spans {
+            match groups.last_mut() {
+                Some(group) if span.0 - group.last().expect("non-empty").1 <= limit => {
+                    group.push(span)
+                }
+                _ => groups.push(vec![span]),
+            }
+        }
+        let weight = |group: &Vec<(u32, u32)>| -> u32 {
+            group
+                .iter()
+                .map(|&(a, b)| ink[a as usize..b as usize].iter().sum::<u32>())
+                .sum()
+        };
+        groups
+            .into_iter()
+            .max_by_key(|g| weight(g))
+            .unwrap_or_default()
+    }
+
+    /// Shrink `a..b` to its inked columns, or `None` if it holds no ink.
+    fn trim_columns(&self, a: u32, b: u32) -> Option<(u32, u32)> {
+        let ink = self.column_ink(a, b);
+        let first = ink.iter().position(|&c| c > 0)? as u32;
+        let last = ink.iter().rposition(|&c| c > 0)? as u32;
+        Some((a + first, a + last + 1))
+    }
+
+    /// The glyph in columns `x0..x1`, scaled so the band fills the cell's
+    /// height (keeping its aspect), centred horizontally. Values are the
+    /// evidence in `[0, 1]`, sampled with box filtering: each cell pixel is
+    /// the area-weighted mean of the source pixels it covers.
+    ///
+    /// The box filter is separable, so it runs as a horizontal pass over
+    /// the band's rows and then a vertical pass over the result.
+    fn cell(&self, x0: u32, x1: u32) -> Vec<f32> {
+        let mut cell = vec![0.0f32; CELL_W * CELL_H];
+        let glyph_w = x1 - x0;
+        let scale = CELL_H as f32 / self.height as f32;
+        let out_w = (glyph_w as f32 * scale).round().clamp(1.0, CELL_W as f32) as usize;
+        let left = (CELL_W - out_w) / 2;
+        let available = self.evidence.width().saturating_sub(x0);
+        let columns = BoxTaps::cached(glyph_w, out_w, available);
+
+        let height = self.height as usize;
+        // Each sum adds its taps in order onto -0.0 (as a float `sum()`
+        // does), whichever loop runs innermost: the horizontal pass a cell
+        // column at a time over every band row at once, from the line's
+        // columns as floats (`Line::columns`); the vertical pass a cell row
+        // at a time over every cell column at once.
+        let band = &self.columns[x0 as usize * height..];
+        CELL_SCRATCH.with_borrow_mut(|(horizontal, column)| {
+            // Every value of each is written before it is read.
+            let grow = |v: &mut Vec<f32>, n: usize| {
+                if v.len() < n {
+                    v.resize(n, 0.0);
+                }
+            };
+            grow(horizontal, height * CELL_W);
+            grow(column, height);
+            let column = &mut column[..height];
+            for cx in 0..out_w {
+                column.fill(-0.0);
+                for &(sx, w) in columns.of(cx) {
+                    for (total, &value) in column.iter_mut().zip(&band[sx * height..][..height]) {
+                        *total += w * value;
+                    }
+                }
+                for (sy, &total) in column.iter().enumerate() {
+                    horizontal[sy * CELL_W + cx] = total;
+                }
+            }
+            self.vertical(&mut cell, horizontal, &columns, out_w, left);
+        });
+        cell
+    }
+
+    /// The vertical pass of [`Line::cell`]: the cell's rows from the
+    /// horizontal pass's (`out_w` values a band row), into `cell` from
+    /// column `left`.
+    ///
+    /// The horizontal pass's rows are `CELL_W` apart, every cell column
+    /// computed and those past `out_w` dropped, so each step is a whole
+    /// row of the cell.
+    fn vertical(
+        &self,
+        cell: &mut [f32],
+        horizontal: &[f32],
+        columns: &BoxTaps,
+        out_w: usize,
+        left: usize,
+    ) {
+        let rows = &self.rows;
+        let mut column_weights = [0.0f32; CELL_W];
+        for (cx, weight) in column_weights.iter_mut().enumerate().take(out_w) {
+            *weight = columns.weight(cx);
+        }
+        for cy in 0..CELL_H {
+            let mut totals = [-0.0f32; CELL_W];
+            for &(sy, w) in rows.of(cy) {
+                let row: &[f32; CELL_W] = horizontal[sy * CELL_W..][..CELL_W]
+                    .try_into()
+                    .expect("a whole row");
+                for (total, &value) in totals.iter_mut().zip(row) {
+                    *total += w * value;
+                }
+            }
+            let row_weight = rows.weight(cy);
+            let mut values = [0.0f32; CELL_W];
+            for ((value, &total), &column_weight) in
+                values.iter_mut().zip(&totals).zip(&column_weights)
+            {
+                let weight = row_weight * column_weight;
+                *value = if weight <= 0.0 {
+                    0.0
+                } else {
+                    total / weight / 255.0
+                };
+            }
+            cell[cy * CELL_W + left..][..out_w].copy_from_slice(&values[..out_w]);
+        }
+    }
+}
+
+thread_local! {
+    /// [`Line::cell`]'s working rows: the horizontal pass, and one cell
+    /// column of it.
+    static CELL_SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<f32>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+/// Box-filter taps resampling `len` source pixels to `out` pixels: for each
+/// output pixel, the source pixels its span covers and how much of each,
+/// skipping source pixels at or beyond `limit`. Stored flat, one
+/// allocation for all output pixels.
+struct BoxTaps {
+    /// `taps[starts[i]..starts[i + 1]]` belong to output pixel `i`.
+    starts: Vec<usize>,
+    taps: Vec<(usize, f32)>,
+    weights: Vec<f32>,
+}
+
+impl BoxTaps {
+    fn new(len: u32, out: usize, limit: u32) -> Self {
+        let step = len as f32 / out as f32;
+        let mut starts = Vec::with_capacity(out + 1);
+        let mut taps = Vec::with_capacity(out * (step.ceil() as usize + 1));
+        let mut weights = Vec::with_capacity(out);
+        for i in 0..out {
+            starts.push(taps.len());
+            let (start, end) = (i as f32 * step, (i + 1) as f32 * step);
+            let mut total = 0.0;
+            let mut source = start.floor() as u32;
+            while (source as f32) < end && source < limit {
+                let weight = end.min(source as f32 + 1.0) - start.max(source as f32);
+                if weight > 0.0 {
+                    taps.push((source as usize, weight));
+                    total += weight;
+                }
+                source += 1;
+            }
+            weights.push(total);
+        }
+        starts.push(taps.len());
+        Self {
+            starts,
+            taps,
+            weights,
+        }
+    }
+
+    /// [`BoxTaps::new`], kept for the next time the same taps are asked
+    /// for. A limit past `len` changes nothing (no tap reaches past the
+    /// source pixel at `len`, which a rounding of `out` steps of `len /
+    /// out` can just touch), so the taps are kept by `len`, `out` and the
+    /// limit up to `len + 1`.
+    fn cached(len: u32, out: usize, limit: u32) -> std::rc::Rc<BoxTaps> {
+        thread_local! {
+            static KEPT: std::cell::RefCell<HashMap<(u32, usize, u32), std::rc::Rc<BoxTaps>>> =
+                std::cell::RefCell::new(HashMap::new());
+        }
+        let key = (len, out, limit.min(len.saturating_add(1)));
+        KEPT.with_borrow_mut(|kept| {
+            if kept.len() > 4096 {
+                kept.clear();
+            }
+            std::rc::Rc::clone(
+                kept.entry(key)
+                    .or_insert_with(|| std::rc::Rc::new(BoxTaps::new(len, out, limit))),
+            )
+        })
+    }
+
+    fn of(&self, i: usize) -> &[(usize, f32)] {
+        &self.taps[self.starts[i]..self.starts[i + 1]]
+    }
+
+    /// Total weight of output pixel `i`'s taps.
+    fn weight(&self, i: usize) -> f32 {
+        self.weights[i]
+    }
+}
+
+/// Pick `parts - 1` cut columns in a run's ink profile: each near its
+/// share of the width, at the least inked column within a small window.
+fn cut_points(ink: &[u32], parts: u32) -> Vec<u32> {
+    let width = ink.len() as u32;
+    let window = (width / (parts * 3)).max(1);
+    (1..parts)
+        .map(|k| {
+            let target = k * width / parts;
+            let lo = target.saturating_sub(window).max(1);
+            let hi = (target + window).min(width - 1);
+            (lo..=hi)
+                .min_by_key(|&c| (ink[c as usize], c.abs_diff(target)))
+                .unwrap_or(target)
+        })
+        .collect()
+}
+
+/// When a labelled example has touching characters, split the widest runs
+/// until there is one run per character. Extra runs are left alone: gluing
+/// runs together to fit a label would teach a template made of two glyphs,
+/// so the caller reports the mismatch instead.
+fn fit_span_count(line: &Line, mut spans: Vec<(u32, u32)>, count: usize) -> Vec<(u32, u32)> {
+    while spans.len() < count && !spans.is_empty() {
+        let (i, &(a, b)) = spans
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, (a, b))| b - a)
+            .expect("at least one span");
+        if b - a < 2 {
+            break;
+        }
+        let cut = a + cut_points(line.column_ink(a, b), 2)[0];
+        let pieces: Vec<(u32, u32)> = [(a, cut), (cut, b)]
+            .into_iter()
+            .filter_map(|(p, q)| line.trim_columns(p, q))
+            .collect();
+        if pieces.len() != 2 {
+            break;
+        }
+        spans.splice(i..=i, pieces);
+    }
+    spans
+}
+
+/// A cell centred on its mean and scaled to unit length. The Pearson
+/// correlation of two cells is then the dot product of their standardised
+/// forms, so each template is standardised once when learned and each
+/// glyph once when read, instead of for every comparison.
+#[derive(Debug, Clone)]
+struct Standardised(Vec<f32>);
+
+impl Standardised {
+    fn new(cell: &[f32]) -> Self {
+        let n = cell.len().max(1) as f32;
+        let mean = lanes(cell, |v| v) / n;
+        let norm = lanes(cell, |v| (v - mean) * (v - mean)).sqrt();
+        // A flat cell has no shape to correlate; all zeros makes every
+        // correlation with it 0.
+        let scale = if norm > 1e-6 { 1.0 / norm } else { 0.0 };
+        Self(cell.iter().map(|v| (v - mean) * scale).collect())
+    }
+
+    /// Pearson correlation with another standardised cell of the same size.
+    fn correlation(&self, other: &Standardised) -> f32 {
+        let (a, b) = (&self.0[..], &other.0[..self.0.len().min(other.0.len())]);
+        let a = &a[..b.len()];
+        let (a_chunks, a_rest) = a.as_chunks::<8>();
+        let (b_chunks, b_rest) = b.as_chunks::<8>();
+        let mut totals = [0.0f32; 8];
+        for (ca, cb) in a_chunks.iter().zip(b_chunks) {
+            for ((total, x), y) in totals.iter_mut().zip(ca).zip(cb) {
+                *total += x * y;
+            }
+        }
+        totals.iter().sum::<f32>() + a_rest.iter().zip(b_rest).map(|(x, y)| x * y).sum::<f32>()
+    }
+}
+
+/// The sum of `f` over a cell, in eight running totals: one running total
+/// is a chain of dependent additions the CPU cannot overlap, and the
+/// compiler may not reorder floating-point sums on its own. A cell is
+/// classified against every template of the font, many times a frame, so
+/// this is where the reader's time went.
+#[inline]
+fn lanes(values: &[f32], f: impl Fn(f32) -> f32) -> f32 {
+    let (chunks, rest) = values.as_chunks::<8>();
+    let mut totals = [0.0f32; 8];
+    for chunk in chunks {
+        for (total, &v) in totals.iter_mut().zip(chunk) {
+            *total += f(v);
+        }
+    }
+    totals.iter().sum::<f32>() + rest.iter().map(|&v| f(v)).sum::<f32>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::draw::{self, GLYPH_WIDTH};
+    use image::Rgba;
+
+    const BAR: Rgba<u8> = Rgba([228, 70, 104, 255]);
+    const INK: Rgba<u8> = Rgba([250, 238, 240, 255]);
+
+    /// Render `text` with the built-in bitmap font onto a coloured bar.
+    fn render(text: &str, scale: u32, spacing: Option<u32>) -> (RgbaImage, Rect) {
+        let advance = spacing.map(|s| GLYPH_WIDTH * scale + s);
+        let width = match advance {
+            Some(a) => a * text.chars().count() as u32,
+            None => draw::text_width(text, scale),
+        } + 24;
+        let height = draw::text_height(scale) + 12;
+        let mut image = RgbaImage::from_pixel(width, height, BAR);
+        let mut plot = |x: i64, y: i64| {
+            if x >= 0 && y >= 0 && (x as u32) < width && (y as u32) < height {
+                image.put_pixel(x as u32, y as u32, INK);
+            }
+        };
+        match advance {
+            None => draw::draw_text(text, 12, 6, scale, &mut plot),
+            Some(a) => {
+                for (i, ch) in text.chars().enumerate() {
+                    draw::draw_text(
+                        &ch.to_string(),
+                        12 + (i as u32 * a) as i64,
+                        6,
+                        scale,
+                        &mut plot,
+                    );
+                }
+            }
+        }
+        let region = Rect {
+            x: 0,
+            y: 0,
+            w: width,
+            h: height,
+        };
+        (image, region)
+    }
+
+    fn digits_font(scale: u32) -> GlyphSet {
+        let mut set = GlyphSet::new(GlyphOptions::default());
+        let (image, region) = render("0123456789/", scale, None);
+        assert_eq!(set.learn(&image, region, "0123456789/"), Ok(11));
+        set
+    }
+
+    fn read_text(set: &GlyphSet, text: &str, scale: u32) -> Detection<TextReading> {
+        let (image, region) = render(text, scale, None);
+        set.read(&image, region)
+    }
+
+    #[test]
+    fn reads_back_numbers_in_the_learned_font() {
+        let set = digits_font(2);
+        for value in ["65132/71867", "25896/29906", "0/1", "400/408", "9876543210"] {
+            let reading = read_text(&set, value, 2);
+            let text = reading.value.as_ref().map(|r| r.text.as_str());
+            assert_eq!(text, Some(value), "{:?}", reading.failure_reason);
+            assert!(reading.confidence.value() > 0.5);
+        }
+    }
+
+    #[test]
+    fn a_font_learned_at_one_size_reads_other_sizes() {
+        let set = digits_font(2);
+        for scale in [1, 3, 4] {
+            let reading = read_text(&set, "71867/71867", scale);
+            assert_eq!(
+                reading.value.map(|r| r.text),
+                Some("71867/71867".to_string()),
+                "scale {scale}: {:?}",
+                reading.failure_reason
+            );
+        }
+    }
+
+    #[test]
+    fn wide_gaps_read_as_spaces() {
+        let set = digits_font(2);
+        let (image, region) = render("12 / 34", 2, None);
+        let reading = set.read(&image, region).value.expect("readable");
+        assert_eq!(reading.text, "12 / 34");
+        assert_eq!(reading.glyphs.len(), 5, "spaces are not glyphs");
+    }
+
+    #[test]
+    fn touching_glyphs_are_split() {
+        let set = digits_font(2);
+        // No spacing at all: adjacent digits share columns of ink.
+        let (image, region) = render("188", 2, Some(0));
+        let reading = set.read(&image, region);
+        assert_eq!(
+            reading.value.map(|r| r.text),
+            Some("188".to_string()),
+            "{:?}",
+            reading.failure_reason
+        );
+    }
+
+    #[test]
+    fn noise_does_not_change_the_reading() {
+        let set = digits_font(2);
+        let (mut image, region) = render("29456/29906", 2, None);
+        let mut state = 7u32;
+        for pixel in image.pixels_mut() {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let jitter = (state >> 24) as i32 % 31 - 15;
+            for c in 0..3 {
+                pixel[c] = (pixel[c] as i32 + jitter).clamp(0, 255) as u8;
+            }
+        }
+        let reading = set.read(&image, region);
+        assert_eq!(
+            reading.value.map(|r| r.text),
+            Some("29456/29906".to_string()),
+            "{:?}",
+            reading.failure_reason
+        );
+    }
+
+    /// A character the set never learned must not be passed off as the
+    /// nearest digit.
+    #[test]
+    fn unknown_characters_make_the_reading_missing() {
+        let set = digits_font(2);
+        let reading = read_text(&set, "12A4", 2);
+        assert!(!reading.is_present());
+        let reason = reading.failure_reason.unwrap();
+        assert!(reason.contains("glyph 2"), "{reason}");
+        // The breakdown is still available for inspection.
+        let (image, region) = render("12A4", 2, None);
+        let all = set.read_all(&image, region).unwrap();
+        assert_eq!(all.glyphs.len(), 4);
+        assert!(
+            all.glyphs[2].score < set.options().min_score
+                || all.glyphs[2].margin < set.options().min_margin
+        );
+    }
+
+    #[test]
+    fn learn_errors_explain_themselves() {
+        let error = LearnError::GlyphCountMismatch {
+            expected: 4,
+            found: 3,
+        };
+        assert_eq!(
+            error.to_string(),
+            "the label has 4 characters but the region splits into 3 glyphs"
+        );
+        let boxed: Box<dyn std::error::Error> = Box::new(LearnError::NoText);
+        assert_eq!(boxed.to_string(), "no text found in the region");
+    }
+
+    #[test]
+    fn an_example_that_does_not_read_back_is_not_learned() {
+        // The text says 3574/3574; a label with a prefix and brackets has
+        // as many characters as the line can be cut into, and would have
+        // taught a '3' that is really a 'M'. The same character twice in
+        // the label looking nothing alike gives it away.
+        let (image, region) = render("3574/3574", 2, None);
+        let mut set = GlyphSet::new(GlyphOptions::default());
+        let wrong = set.learn(&image, region, "MP[3574/3574]");
+        assert!(
+            matches!(
+                wrong,
+                Err(LearnError::Inconsistent { .. } | LearnError::DoesNotReadBack { .. })
+            ),
+            "{wrong:?}"
+        );
+        assert_eq!(set.chars().count(), 0, "nothing kept from the wrong label");
+        // The right label reads back, and is kept.
+        assert_eq!(set.learn(&image, region, "3574/3574"), Ok(9));
+        assert_eq!(set.read(&image, region).value.unwrap().text, "3574/3574");
+        // Noise with enough runs to cut into a label's worth of pieces is
+        // refused too.
+        let mut state = 99u32;
+        let noise = RgbaImage::from_fn(300, 16, |_, _| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let v = (state >> 24) as u8;
+            Rgba([v, v / 2, 255 - v, 255])
+        });
+        let whole = Rect {
+            x: 0,
+            y: 0,
+            w: 300,
+            h: 16,
+        };
+        let mut fresh = GlyphSet::new(GlyphOptions::default());
+        let from_noise = fresh.learn(&noise, whole, "HP[6370/6370]");
+        assert!(from_noise.is_err(), "{from_noise:?}");
+        assert_eq!(fresh.chars().count(), 0);
+    }
+
+    #[test]
+    fn learning_requires_the_label_to_match_the_glyphs() {
+        let mut set = GlyphSet::new(GlyphOptions::default());
+        let (image, region) = render("123", 2, None);
+        // Two labels for three separate glyphs: gluing two of them into one
+        // template would poison the set, so the mismatch is reported.
+        assert_eq!(
+            set.learn(&image, region, "12"),
+            Err(LearnError::GlyphCountMismatch {
+                expected: 2,
+                found: 3
+            })
+        );
+        assert_eq!(
+            set.chars().count(),
+            0,
+            "nothing was learned from the bad example"
+        );
+        let blank = RgbaImage::from_pixel(40, 20, BAR);
+        assert_eq!(
+            set.learn(
+                &blank,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 40,
+                    h: 20
+                },
+                "1"
+            ),
+            Err(LearnError::NoText)
+        );
+        assert!(
+            set.read_all(
+                &blank,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 40,
+                    h: 20
+                }
+            )
+            .is_none()
+        );
+    }
+
+    /// Two seven-segment style digits, each with blank columns *inside*
+    /// the glyph (segments that do not touch), separated by a wider gap.
+    fn segmented_pair() -> (RgbaImage, Rect) {
+        let mut image = RgbaImage::from_pixel(60, 24, BAR);
+        let mut bar = |x0: u32, x1: u32, y0: u32, y1: u32| {
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    image.put_pixel(x, y, INK);
+                }
+            }
+        };
+        // "0": two verticals with a two-column gap between them and the
+        // horizontals, which do not reach the verticals.
+        bar(6, 8, 4, 20);
+        bar(16, 18, 4, 20);
+        bar(9, 15, 4, 6);
+        bar(9, 15, 18, 20);
+        // "1" style glyph: two verticals with a two-column gap, four columns
+        // to the right of the "0" (a glyph gap, narrower than a space).
+        bar(22, 24, 4, 20);
+        bar(26, 28, 4, 20);
+        (
+            image,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 60,
+                h: 24,
+            },
+        )
+    }
+
+    #[test]
+    fn min_gap_keeps_segmented_digits_whole() {
+        let (image, region) = segmented_pair();
+        // Splitting at every blank column sees the five segments, not the
+        // two digits.
+        let mut strict = GlyphSet::new(GlyphOptions::default());
+        assert_eq!(
+            strict.learn(&image, region, "01"),
+            Err(LearnError::GlyphCountMismatch {
+                expected: 2,
+                found: 5
+            })
+        );
+        // Gaps narrower than three columns are inside a glyph.
+        let mut lenient = GlyphSet::new(GlyphOptions {
+            min_gap: 3,
+            ..GlyphOptions::default()
+        });
+        assert_eq!(lenient.learn(&image, region, "01"), Ok(2));
+        let reading = lenient.read(&image, region).value.expect("read back");
+        assert_eq!(reading.text, "01");
+        assert_eq!(reading.glyphs.len(), 2);
+        // The wider gap between the digits still separates them, so the
+        // first glyph's box stops before the second digit starts.
+        assert!(reading.glyphs[0].bounds.x + reading.glyphs[0].bounds.w <= 22);
+    }
+
+    #[test]
+    fn dark_text_on_a_light_panel_is_read_with_dark_polarity() {
+        let options = GlyphOptions {
+            channel: Channel::Luma,
+            polarity: Polarity::DarkText,
+            ..GlyphOptions::default()
+        };
+        let mut set = GlyphSet::new(options);
+        let paper = Rgba([235, 232, 220, 255]);
+        let ink = Rgba([30, 30, 40, 255]);
+        let draw_on = |text: &str| {
+            let width = draw::text_width(text, 2) + 20;
+            let mut image = RgbaImage::from_pixel(width, 30, paper);
+            draw::draw_text(text, 10, 8, 2, |x, y| {
+                image.put_pixel(x as u32, y as u32, ink)
+            });
+            (
+                image,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: width,
+                    h: 30,
+                },
+            )
+        };
+        let (image, region) = draw_on("0123456789");
+        set.learn(&image, region, "0123456789").unwrap();
+        let (image, region) = draw_on("2026");
+        assert_eq!(
+            set.read(&image, region).value.map(|r| r.text),
+            Some("2026".to_string())
+        );
+    }
+
+    /// `text` printed over a status bar 300 wide, filled up to `fill` (the
+    /// whole bar when `None`): the empty track beyond the fill is lighter
+    /// than the fill and taller than the writing, the fill ends in a bright
+    /// edge the full height of the bar, and both ends of the bar are
+    /// capped the same way. The region is the whole bar with a margin.
+    fn bar_with_track(text: &str, fill: Option<u32>) -> (RgbaImage, Rect) {
+        let track = Rgba([150, 140, 145, 255]);
+        let edge = Rgba([255, 205, 220, 255]);
+        let (width, height) = (300, draw::text_height(2) + 16);
+        let mut image = RgbaImage::from_pixel(width, height, BAR);
+        let fill = fill.unwrap_or(width);
+        for y in 0..height {
+            for x in 0..width {
+                let cap = (x < 2 || x + 2 >= width) && y > 0 && y + 1 < height;
+                let fill_end = fill < width && x + 2 >= fill && x < fill;
+                if cap || fill_end {
+                    image.put_pixel(x, y, edge);
+                } else if x >= fill && y >= 2 && y + 2 < height {
+                    image.put_pixel(x, y, track);
+                }
+            }
+        }
+        let left = (width - draw::text_width(text, 2)) / 2;
+        draw::draw_text(text, left as i64, 8, 2, |x, y| {
+            image.put_pixel(x as u32, y as u32, INK)
+        });
+        (
+            image,
+            Rect {
+                x: 0,
+                y: 0,
+                w: width,
+                h: height,
+            },
+        )
+    }
+
+    /// `text` in the bitmap font at `scale`, every stroke one pixel wider
+    /// than the scale makes it: the font as another size draws it, not
+    /// the same shapes scaled.
+    fn render_bold(text: &str, scale: u32) -> (RgbaImage, Rect) {
+        let width = draw::text_width(text, scale) + 24;
+        let height = draw::text_height(scale) + 12;
+        let mut image = RgbaImage::from_pixel(width, height, BAR);
+        draw::draw_text(text, 12, 6, scale, |x, y| {
+            for dx in 0..=1 {
+                let x = x as u32 + dx;
+                if x < width {
+                    image.put_pixel(x, y as u32, INK);
+                }
+            }
+        });
+        (
+            image,
+            Rect {
+                x: 0,
+                y: 0,
+                w: width,
+                h: height,
+            },
+        )
+    }
+
+    #[test]
+    fn a_font_learned_at_two_sizes_keeps_a_template_per_size() {
+        // The same characters at 14 and 28 pixels, drawn differently (the
+        // strokes of the larger are five pixels, not four): one font, two
+        // sizes, as a game's HUD has them.
+        let mut set = GlyphSet::new(GlyphOptions::default());
+        let (small, small_region) = render("0123456789/", 2, None);
+        let (big, big_region) = render_bold("0123456789/", 4);
+        assert_eq!(set.learn(&small, small_region, "0123456789/"), Ok(11));
+        assert_eq!(set.learn(&big, big_region, "0123456789/"), Ok(11));
+        assert_eq!(
+            set.chars().count(),
+            11,
+            "each character once, whatever its sizes"
+        );
+        // Each size reads with its own templates, pixel for pixel: had the
+        // sizes been averaged into one template, neither would score so.
+        for (image, region, size) in [(&small, small_region, "small"), (&big, big_region, "big")] {
+            let reading = set.read(image, region).value.expect(size);
+            assert_eq!(reading.text, "0123456789/");
+            let worst = reading
+                .glyphs
+                .iter()
+                .map(|g| g.score)
+                .fold(1.0f32, f32::min);
+            assert!(worst > 0.99, "{size}: the worst glyph scores {worst:.3}");
+        }
+        // A size never learned is read with every template there is (the
+        // glyphs spread out, so no row of the crop is mostly ink).
+        let (middle, middle_region) = render("2026", 3, Some(40));
+        let reading = set.read(&middle, middle_region);
+        assert_eq!(
+            reading.value.map(|r| r.text.replace(' ', "")),
+            Some("2026".to_string()),
+            "{:?}",
+            reading.failure_reason
+        );
+    }
+
+    #[test]
+    fn the_empty_track_beside_a_bars_fill_is_not_a_glyph() {
+        // The fill ends 20 columns past the writing: the lighter track beside
+        // it, taller than the digits, is nearer to them than a space.
+        let text = "4972/6370";
+        let fill = (300 + draw::text_width(text, 2)) / 2 + 20;
+        let (partial, region) = bar_with_track(text, Some(fill));
+        let (full, _) = bar_with_track(text, None);
+        // Lower still: the fill ends four columns past the last digit.
+        let (lower, _) = bar_with_track(text, Some(fill - 16));
+
+        let mut from_partial = GlyphSet::new(GlyphOptions::default());
+        assert_eq!(from_partial.learn(&partial, region, text), Ok(9));
+        let mut from_full = GlyphSet::new(GlyphOptions::default());
+        assert_eq!(from_full.learn(&full, region, text), Ok(9));
+        for (font, learned_on) in [(&from_partial, "a partial bar"), (&from_full, "a full bar")] {
+            for (picture, shown) in [(&full, "full"), (&partial, "partial"), (&lower, "lower")] {
+                let reading = font.read(picture, region);
+                let read = reading.value.as_ref().map(|r| r.text.as_str());
+                assert_eq!(
+                    read,
+                    Some(text),
+                    "learned on {learned_on}, reading the {shown} bar: {:?}",
+                    reading.failure_reason
+                );
+                // The line is measured by the writing, not by the track or
+                // the bar's edges standing taller beside it.
+                let glyphs = &reading.value.as_ref().unwrap().glyphs;
+                assert!(
+                    glyphs
+                        .iter()
+                        .all(|g| g.bounds.h == draw::text_height(2) && g.bounds.y == 8),
+                    "the {shown} bar's glyphs: {:?}",
+                    glyphs.iter().map(|g| g.bounds).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    /// [`Line::cell`] as it was written first: a cell value at a time,
+    /// each tap's sum from the evidence directly.
+    fn cell_one_by_one(line: &Line, x0: u32, x1: u32) -> Vec<f32> {
+        let mut cell = vec![0.0f32; CELL_W * CELL_H];
+        let glyph_w = x1 - x0;
+        let scale = CELL_H as f32 / line.height as f32;
+        let out_w = (glyph_w as f32 * scale).round().clamp(1.0, CELL_W as f32) as usize;
+        let left = (CELL_W - out_w) / 2;
+        let available = line.evidence.width().saturating_sub(x0);
+        let columns = BoxTaps::new(glyph_w, out_w, available);
+        let rows = BoxTaps::new(line.height, CELL_H, line.height);
+        let evidence = line.evidence.as_raw();
+        let stride = line.evidence.width() as usize;
+        let mut horizontal = vec![0.0f32; line.height as usize * out_w];
+        for sy in 0..line.height as usize {
+            let row = (line.top as usize + sy) * stride + x0 as usize;
+            for cx in 0..out_w {
+                horizontal[sy * out_w + cx] = columns
+                    .of(cx)
+                    .iter()
+                    .map(|&(sx, w)| w * f32::from(evidence[row + sx]))
+                    .sum();
+            }
+        }
+        for cy in 0..CELL_H {
+            for cx in 0..out_w {
+                let weight = rows.weight(cy) * columns.weight(cx);
+                if weight <= 0.0 {
+                    continue;
+                }
+                let total: f32 = rows
+                    .of(cy)
+                    .iter()
+                    .map(|&(sy, w)| w * horizontal[sy * out_w + cx])
+                    .sum();
+                cell[cy * CELL_W + left + cx] = total / weight / 255.0;
+            }
+        }
+        cell
+    }
+
+    #[test]
+    fn a_cell_is_the_one_made_a_value_at_a_time() {
+        // Every band height a line takes, every glyph width a split tries
+        // (up to past the region's edge, where the taps stop short), on
+        // evidence of every level and of zeros.
+        let mut state = 0x2545_f491u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for height in 1..48u32 {
+            let width = 3 * height + 7;
+            let mut evidence = GrayImage::new(width, height + 4);
+            for p in evidence.pixels_mut() {
+                p.0[0] = match next() % 4 {
+                    0 => 0,
+                    1 => 255,
+                    _ => (next() % 256) as u8,
+                };
+            }
+            let mut line = Line {
+                origin: (0, 0),
+                evidence,
+                top: 0,
+                height: 0,
+                ink_threshold: 100,
+                min_gap: 1,
+                ink: Vec::new(),
+                rows: BoxTaps::new(0, 0, 0),
+                columns: Vec::new(),
+            };
+            line.set_band(2, height);
+            for x0 in [
+                0,
+                1,
+                width / 3,
+                width - 2 * height.min(width / 2),
+                width - 2,
+                width - 1,
+            ] {
+                for x1 in x0 + 1..=width.min(x0 + 2 * height + 2) {
+                    let (got, want) = (line.cell(x0, x1), cell_one_by_one(&line, x0, x1));
+                    assert!(
+                        got.iter()
+                            .map(|v| v.to_bits())
+                            .eq(want.iter().map(|v| v.to_bits())),
+                        "height {height}, columns {x0}..{x1}"
+                    );
+                }
+            }
+        }
+    }
+}
