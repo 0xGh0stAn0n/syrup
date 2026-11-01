@@ -31,6 +31,8 @@ from .vsr import LanguageUnavailable, ModelSpec, VisualSpeechModel, registry
 
 FLUSH_FRAMES = 1500        # per track: read closed speech spans and drop their crops beyond this
 MIN_CHUNK_FRAMES = 8
+# Detections a track needs to be a person, unless it was read saying something.
+MIN_DETECTIONS = 3
 
 
 @dataclass
@@ -334,6 +336,10 @@ class Analyzer:
         """audio_offset: the video time at which the audio samples begin."""
         tracks = self.tracker.finish()
         self._end_tracks(tracks)
+        # A face found once or twice, that said nothing, is a detector's
+        # stray hit, not a person (CI's decoder gave one, a frame's box
+        # inside another face's).
+        tracks = [t for t in tracks if t.detections >= MIN_DETECTIONS or any(s.track_id == t.track_id for s in self.segments)]
         people = self.ended
         person_tracks: List[PersonTrack] = []
         for track in tracks:
