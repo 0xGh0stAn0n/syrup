@@ -1,0 +1,11 @@
+[1m[92m   Compiling[0m syrup v0.1.0 (/home/runner/work/syrup/syrup)
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 4.05s
+[1m[92m     Running[0m unittests src/lib.rs (target/debug/deps/syrup-17def2f94da0e75c)
+
+running 2 tests
+test capture::tests::a_window_titled_exactly_so_wins_over_one_that_contains_it ... ok
+capture of "Syrup capture test": 320x200, frames from the CPU (no GPU capture path on this platform)
+test capture::tests::a_window_is_captured_whole_and_a_region_at_a_time ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 245 filtered out; finished in 0.00s
+
