@@ -584,16 +584,15 @@ where
     F: Fn(&Rgba<u8>) -> bool,
 {
     let groove = match sample_groove_color(image, fill, search, &is_filled) {
-        Groove::Colour(colour) => Some(colour),
+        Groove::Colour(colour, outside) => Some((colour, outside)),
         // Past the fill lies the world outside the bar: the bar is full.
         Groove::Background => None,
         // Nothing past the fill to sample: nothing can be said about the
         // track from here.
         Groove::Unknown => return None,
     };
-    let is_empty = |pixel: &Rgba<u8>| match groove {
-        Some(reference) => is_similar_color(pixel, reference, GROOVE_TOLERANCE),
-        None => false,
+    let is_empty = |pixel: &Rgba<u8>| {
+        groove.is_some_and(|(colour, outside)| is_groove(pixel, colour, outside))
     };
     if fill.w == 0 || fill.h == 0 {
         return None;
@@ -635,7 +634,7 @@ pub fn measure_color_bar_fill(
         crate::color::is_color_pixel(pixel, hue_range, min_saturation, min_value)
     };
     let groove = match sample_groove_color(image, fill, search, &is_filled) {
-        Groove::Colour(colour) => Some(colour),
+        Groove::Colour(colour, outside) => Some((colour, outside)),
         Groove::Background => None,
         Groove::Unknown => return None,
     };
@@ -664,8 +663,8 @@ pub fn measure_color_bar_fill(
                 for (c, pixel) in row.as_chunks::<4>().0.iter().enumerate() {
                     if mask[0] & (1 << c) != 0 {
                         filled[c] += 1;
-                    } else if let Some(reference) = groove
-                        && is_similar_color(&Rgba(*pixel), reference, GROOVE_TOLERANCE)
+                    } else if let Some((colour, outside)) = groove
+                        && is_groove(&Rgba(*pixel), colour, outside)
                     {
                         empty[c] += 1;
                     }
@@ -818,8 +817,29 @@ fn bar_core_rows(image: &RgbaImage, fill: Rect) -> Option<(u32, u32)> {
 /// UI do not pass as groove.
 const GROOVE_TOLERANCE: i32 = 38;
 
+/// How far apart, per channel at most, what lies past a full bar may be
+/// from what lies above it and still be the same world outside the bar: a
+/// recording's noise, not a groove a few shades off the HUD (a dark groove
+/// on a dark HUD is still a groove).
+const OUTSIDE_TOLERANCE: i32 = 12;
+
+fn color_distance(pixel: &Rgba<u8>, reference: [u8; 3]) -> i32 {
+    (0..3)
+        .map(|channel| (pixel[channel] as i32 - reference[channel] as i32).abs())
+        .max()
+        .unwrap_or(0)
+}
+
 fn is_similar_color(pixel: &Rgba<u8>, reference: [u8; 3], tolerance: i32) -> bool {
-    (0..3).all(|channel| (pixel[channel] as i32 - reference[channel] as i32).abs() <= tolerance)
+    color_distance(pixel, reference) <= tolerance
+}
+
+/// A pixel of the empty track: near the groove's colour, and nearer it than
+/// the colour around the bar, so the walk stops where the track ends even
+/// on a HUD within [`GROOVE_TOLERANCE`] of the groove.
+fn is_groove(pixel: &Rgba<u8>, groove: [u8; 3], outside: Option<[u8; 3]>) -> bool {
+    let off = color_distance(pixel, groove);
+    off <= GROOVE_TOLERANCE && outside.is_none_or(|outside| off < color_distance(pixel, outside))
 }
 
 /// Learn the groove colour from the columns immediately after the fill.
@@ -829,8 +849,9 @@ fn is_similar_color(pixel: &Rgba<u8>, reference: [u8; 3], tolerance: i32) -> boo
 /// correctly reports 100%.
 /// What lies just past a bar's fill.
 enum Groove {
-    /// The empty track, in this colour.
-    Colour([u8; 3]),
+    /// The empty track, in this colour, and the colour around the bar
+    /// (when there are rows above it to see).
+    Colour([u8; 3], Option<[u8; 3]>),
     /// The world outside the bar: the bar is full.
     Background,
     /// Nothing to sample (the bar fills its box to the edge).
@@ -879,16 +900,17 @@ where
     // outside the bar. Distinguish them by looking just above the bar,
     // which is definitionally outside it — if the candidate matches that,
     // it is background and there is no groove, so the bar reads as full.
-    if let Some(outside) = sample_outside_color(image, fill)
+    let outside = sample_outside_color(image, fill);
+    if let Some(outside) = outside
         && is_similar_color(
             &Rgba([candidate[0], candidate[1], candidate[2], 255]),
             outside,
-            GROOVE_TOLERANCE,
+            OUTSIDE_TOLERANCE,
         )
     {
         return Groove::Background;
     }
-    Groove::Colour(candidate)
+    Groove::Colour(candidate, outside)
 }
 
 /// Sample the colour just above the bar, which is outside its track.
@@ -1619,6 +1641,43 @@ mod tests {
         let (image, fill) = bar_frame(100, 200, 1.0);
         let percent = measure_bar_fill(&image, fill, search, red_filled).unwrap();
         assert!((percent - 100.0).abs() <= 1.0, "full bar read {percent}%");
+    }
+
+    #[test]
+    fn a_dark_groove_on_a_dark_hud_is_track_not_the_hud() {
+        // A groove a few shades off the HUD around it: within the groove's
+        // tolerance, but not the same colour. It read as no groove (a full
+        // bar), and its walk as the whole frame.
+        for track in [[16u8, 16, 16], [70, 70, 78]] {
+            let mut image = RgbaImage::from_pixel(1280, 720, Rgba([40, 40, 40, 255]));
+            for y in 660..672 {
+                for x in 100..1100 {
+                    let [r, g, b] = if x < 500 { [210, 40, 40] } else { track };
+                    image.put_pixel(x, y, Rgba([r, g, b, 255]));
+                }
+            }
+            let fill = Rect {
+                x: 100,
+                y: 660,
+                w: 400,
+                h: 12,
+            };
+            let search = Rect {
+                x: 0,
+                y: 480,
+                w: 1280,
+                h: 240,
+            };
+            let colour = ((340.0, 30.0), 0.35, 0.30);
+            let general = measure_bar_fill(&image, fill, search, red_filled).unwrap();
+            let fast = measure_color_bar_fill(&image, fill, search, colour).unwrap();
+            for percent in [general, fast] {
+                assert!(
+                    (percent - 40.0).abs() <= 1.0,
+                    "track {track:?} read {percent}%"
+                );
+            }
+        }
     }
 
     #[test]

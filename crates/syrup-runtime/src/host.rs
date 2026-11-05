@@ -152,8 +152,14 @@ pub fn measure(
     };
     let rects: Vec<Rect> = boxes.iter().map(rect).collect();
     // Only the boxes' rows are read (fill searches along them, across the
-    // whole view), so only those are converted.
-    let top = rects.iter().map(|r| r.y).min().unwrap_or(0);
+    // whole view), so only those are converted, and the few above them
+    // that fill compares the empty track with (what is around the bar).
+    let top = rects
+        .iter()
+        .map(|r| r.y)
+        .min()
+        .unwrap_or(0)
+        .saturating_sub(3);
     let bottom = rects.iter().map(|r| r.y + r.h).max().unwrap_or(0);
     let pixels = view.rows_to_rgba(top, bottom.max(top));
     let local = |r: &Rect| Rect { y: r.y - top, ..*r };
