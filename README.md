@@ -534,13 +534,13 @@ pixels *mean* there:
 
 ```text
         MapleSyrup            the MapleStory edition
-             │                github.com/boggioMichael/ms
+             │                github.com/datta-syrup/ms
              │ Cargo git dependency, pinned to a tag
              ▼
            Syrup              this repository
 ```
 
-[MapleSyrup](https://github.com/boggioMichael/ms) is the first such
+[MapleSyrup](https://github.com/datta-syrup/ms) is the first such
 edition, and is where these primitives were developed against real
 captures before being generalised; its per-frame path runs on Syrup
 alone, with no vision code of its own and no OCR or model on it. Syrup
